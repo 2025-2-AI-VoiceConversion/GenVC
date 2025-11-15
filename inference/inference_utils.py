@@ -132,7 +132,7 @@ def synthesize_utt_chunked(
 
     return synthesized_audio
 
-@torch.inference_mode()
+@torch.inference_mode() # Do not modify
 def synthesize_utt_streaming(
     genVC_mdl, 
     src_wav, 
@@ -141,6 +141,7 @@ def synthesize_utt_streaming(
     stream_chunk_size=8):
 
     wav_gen_prev, wav_overlap = None, None
+    
     total_wavlen = src_wav.shape[-1]
     pred_audios = []
     min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate)
@@ -215,3 +216,78 @@ def synthesize_utt_streaming(
     real_time_factor = processed_time / (total_wavlen / genVC_mdl.content_sample_rate)
     print(f"Real-time factor: {real_time_factor:.3f}")
     return synthesized_audio
+
+@torch.inference_mode() 
+def synthesize_utt_streaming_mic(
+    genVC_mdl, 
+    src_wav, 
+    cond_latent, 
+    stream_chunk_size=8):
+
+    wav_gen_prev, wav_overlap = None, None
+    pred_audios = []
+    min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate)
+
+    begin_time = time.time()
+    is_begin = True
+    
+    content_feat = genVC_mdl.content_extractor.extract_content_features(src_wav)
+    content_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
+        
+    # 임베딩 제작 : [화자 프롬프트, 내용 문맥, START_AUDIO] 
+    gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_codes)
+
+    # GPT 제네레이터를 생성함 - 이 병목이 얼마나 오래 걸릴까? 
+    gpt_generator = genVC_mdl.gpt.get_generator(
+        fake_inputs=gpt_inputs,
+        top_p=genVC_mdl.config.top_p,
+        top_k=genVC_mdl.config.top_k,
+        temperature=genVC_mdl.config.temperature,
+        length_penalty=genVC_mdl.config.length_penalty,
+        repetition_penalty=genVC_mdl.config.repetition_penalty,
+        do_sample=True,
+        num_beams=1,
+        num_return_sequences=1,
+        output_attentions=False,
+        output_hidden_states=True,
+    )
+
+    last_tokens = []
+    all_latents = []
+    is_end = False
+        
+    while not is_end:
+        try:
+            x, latent = next(gpt_generator)
+            last_tokens += [x]
+            all_latents += [latent]
+        except StopIteration:
+            is_end = True
+
+        # 8개의 음성 토큰을 GPT가 만들어 내면, 보코더로 음성 조각을 만들어 리턴한다 
+        if is_end or (stream_chunk_size > 0 and len(last_tokens) >= stream_chunk_size):
+            acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
+            mel_input = torch.nn.functional.interpolate(
+                acoustic_latents.transpose(1, 2),
+                scale_factor=[genVC_mdl.hifigan_scale_factor],
+                mode="linear",
+            ).squeeze(1)
+            audio_pred = genVC_mdl.hifigan.forward(mel_input)
+            
+            # 이거 안해도 되지 않냐 지금은? 뭔가 이거 처리도
+            
+            wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+                audio_pred.squeeze(), wav_gen_prev, wav_overlap, 1024)
+            
+            pred_audios.append(wav_chunk)
+                
+            # Speak
+            last_tokens = []
+            all_latents = []
+                
+            if is_begin:
+                is_begin = False
+                latency = time.time() - begin_time
+                print(f"Latency: {latency:.3f}s")
+    
+            return pred_audios # 8 tokens (0.34 Audio Length) 
