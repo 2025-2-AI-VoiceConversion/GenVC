@@ -35,6 +35,15 @@ brew install portaudio
 python infer_stream.py --model_path pre_trained/GenVC_small.pth --ref_audio samples/EM1_ENG_0037_1.wav 
 ```
 
+## Mode
+```sh
+python infer_stream.py --model_path pre_trained/GenVC_small.pth --ref_audio samples/EM1_ENG_0037_1.wav --mode default 
+# 딥러닝 모델(GenVC)사용하여 처리
+
+python infer_stream.py --model_path pre_trained/GenVC_small.pth --ref_audio samples/EM1_ENG_0037_1.wav --mode test
+# 내가 말한 음성을 그대로 다시 출력함 
+```
+
 - 현재 녹음 및 출력 분리나 하울링 문제가 전혀 해결되어 있지 않으므로 볼륨을 줄여서 녹음 / 마이크를 사용해 녹음하는 것이 권장된다. 
 
 # 리서치 요구 사항
