@@ -217,77 +217,108 @@ def synthesize_utt_streaming(
     print(f"Real-time factor: {real_time_factor:.3f}")
     return synthesized_audio
 
-@torch.inference_mode() 
+@torch.inference_mode() # Now use 
 def synthesize_utt_streaming_mic(
     genVC_mdl, 
-    src_wav, 
-    cond_latent, 
-    stream_chunk_size=8):
+    content_token_sequence, # 최대 6초 분량의 context token sequence 
+    cond_latent, # 프롬프트 임베딩 : 외부에서 한번만 미리 계산 (전달만 받음)
+    stream_chunk_size=1,
+    num_token=25, # 한 청크가 몇개의 토큰을 담당하는지 설정 
+    wav_gen_prev=None, 
+    wav_overlap=None,
+    ):
 
-    wav_gen_prev, wav_overlap = None, None
-    pred_audios = []
-    min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate)
+    pred_audios = [] 
+
+    '''
+    [동료 개발자 구현 영역]
+    입력받은 src_content(전체 토큰 시퀀스)를 기반으로,
+    가장 최근 청크(1초)에 해당하는 음성만을 생성하여 리턴해야 합니다.
+    
+    - Generator 상태 관리 (Caching)
+    - Look-ahead / Look-behind 적용, Output Slicing [단 이부분은 보코더 조사 후 pysunn 구현 예정]
+    등의 로직이 이곳에 구현됩니다.
+
+    # 현재 사용하지 않음 
+    min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate) # current not use
+    ''' 
+    
+    # 지금 상태는 현재 1초랑 과거 5초의 토큰을 사용하고 있습니다. 
 
     begin_time = time.time()
     is_begin = True
     
-    content_feat = genVC_mdl.content_extractor.extract_content_features(src_wav)
-    content_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
+    t_gpt_start = time.time()
+    # 총 chunk_size 개 만큼 반복합니다. 만약 chunk_size = 2라면 두개의 청크에 대해서 처리합니다. 
+    for i in range(0, stream_chunk_size): 
         
-    # 임베딩 제작 : [화자 프롬프트, 내용 문맥, START_AUDIO] 
-    gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_codes)
+        # 임베딩 제작 : [화자 프롬프트, 내용 문맥, START_AUDIO] 
+        # 슬라이딩 윈도우 어텐션 구현 없이, 이전에 만들었던 모든 임베딩을 전부 저장합니다. 
+        gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_token_sequence) 
 
-    # GPT 제네레이터를 생성함 - 이 병목이 얼마나 오래 걸릴까? 
-    gpt_generator = genVC_mdl.gpt.get_generator(
-        fake_inputs=gpt_inputs,
-        top_p=genVC_mdl.config.top_p,
-        top_k=genVC_mdl.config.top_k,
-        temperature=genVC_mdl.config.temperature,
-        length_penalty=genVC_mdl.config.length_penalty,
-        repetition_penalty=genVC_mdl.config.repetition_penalty,
-        do_sample=True,
-        num_beams=1,
-        num_return_sequences=1,
-        output_attentions=False,
-        output_hidden_states=True,
-    )
-
-    last_tokens = []
-    all_latents = []
-    is_end = False
+        gpt_generator = genVC_mdl.gpt.get_generator( 
+            fake_inputs=gpt_inputs,
+            top_p=genVC_mdl.config.top_p,
+            top_k=genVC_mdl.config.top_k,
+            temperature=genVC_mdl.config.temperature,
+            length_penalty=genVC_mdl.config.length_penalty,
+            repetition_penalty=genVC_mdl.config.repetition_penalty,
+            do_sample=True, # 이거 False로 하면 샘플 스트림 추론 안되더라 
+            num_beams=1,
+            num_return_sequences=1,
+            output_attentions=False,
+            output_hidden_states=True,
+        )
         
-    while not is_end:
-        try:
-            x, latent = next(gpt_generator)
-            last_tokens += [x]
-            all_latents += [latent]
-        except StopIteration:
-            is_end = True
+        # 2. Generate Tokens
+        all_latents = []
+        last_tokens = []
+        is_end = False
 
-        # 8개의 음성 토큰을 GPT가 만들어 내면, 보코더로 음성 조각을 만들어 리턴한다 
-        if is_end or (stream_chunk_size > 0 and len(last_tokens) >= stream_chunk_size):
-            acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
-            mel_input = torch.nn.functional.interpolate(
-                acoustic_latents.transpose(1, 2),
-                scale_factor=[genVC_mdl.hifigan_scale_factor],
-                mode="linear",
-            ).squeeze(1)
-            audio_pred = genVC_mdl.hifigan.forward(mel_input)
+        t_gpt_start = time.time()
+        while not is_end:
+            try:
+                x, latent = next(gpt_generator)
+                last_tokens += [x]
+                all_latents += [latent]
+            except StopIteration:
+                is_end = True
             
-            # 이거 안해도 되지 않냐 지금은? 뭔가 이거 처리도
-            
-            wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
-                audio_pred.squeeze(), wav_gen_prev, wav_overlap, 1024)
-            
-            pred_audios.append(wav_chunk)
+            # 8개의 음성 토큰을 GPT가 만들어 내면, 보코더로 음성 조각을 만들어 리턴한다 
+            if is_end or (num_token > 0 and len(last_tokens) >= num_token):
+                t_gpt_end = time.time()
                 
-            # Speak
-            last_tokens = []
-            all_latents = []
+                acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
+                mel_input = torch.nn.functional.interpolate(
+                    acoustic_latents.transpose(1, 2),
+                    scale_factor=[genVC_mdl.hifigan_scale_factor],
+                    mode="linear",
+                ).squeeze(1)
+                audio_pred = genVC_mdl.hifigan.forward(mel_input)
+            
+                t_vocoder_end = time.time()
+                print(f"   [Detail] GPT: {t_gpt_end - t_gpt_start:.3f}s | Vocoder: {t_vocoder_end - t_gpt_end:.3f}s")
+
+                # 크로스 페이딩 안함 
+                wav_chunk = audio_pred.squeeze()
+                # Cross-Fading 적용 (일단은 나중에 생각) (지금은 청크 띡띡거림 있음.)
+                #wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+                #   audio_pred.squeeze(), wav_gen_prev, wav_overlap, overlap_len=1024
+                #)
                 
-            if is_begin:
-                is_begin = False
-                latency = time.time() - begin_time
-                print(f"Latency: {latency:.3f}s")
-    
-            return pred_audios # 8 tokens (0.34 Audio Length) 
+                pred_audios.append(wav_chunk)
+                
+                # Speak
+                last_tokens = []
+                all_latents = []
+                
+                if is_begin:
+                    is_begin = False
+                    latency = time.time() - begin_time
+                    print(f"Latency: {latency:.3f}s")
+                    
+                # 한 청크만 만들고 탈출 (스트리밍 루프 제어용)
+                break
+                    
+    # 일단 지금 구현은 6초만큼 생성하고 바로 넘겨주는 쓰레기 구현임.. 
+    return pred_audios

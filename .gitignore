@@ -14,3 +14,7 @@ wandb/
 pymp-*/
 tmp*/
 test/
+samples/sample.wav
+analysis/
+infer_test*
+infer_stream_*
