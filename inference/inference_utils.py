@@ -132,15 +132,16 @@ def synthesize_utt_chunked(
 
     return synthesized_audio
 
-@torch.inference_mode()
+@torch.inference_mode() # Do not modify
 def synthesize_utt_streaming(
     genVC_mdl, 
     src_wav, 
-    tgt_audio, 
+    tgt_audio,
     seg_len=6.0,
     stream_chunk_size=8):
 
     wav_gen_prev, wav_overlap = None, None
+    
     total_wavlen = src_wav.shape[-1]
     pred_audios = []
     min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate)
@@ -153,7 +154,6 @@ def synthesize_utt_streaming(
     tgt_audio = tgt_audio.to(genVC_mdl.device)
     cond_latent = genVC_mdl.get_gpt_cond_latents(tgt_audio, genVC_mdl.config.audio.sample_rate)
     is_begin = True
-    
     for i in range(0, total_wavlen, seg_len):
         seg_end = i+seg_len if i+seg_len < total_wavlen else total_wavlen
         if seg_end == total_wavlen:
@@ -209,6 +209,85 @@ def synthesize_utt_streaming(
                     is_begin = False
                     latency = time.time() - begin_time
                     print(f"Latency: {latency:.3f}s")
+    
+    synthesized_audio = torch.cat(pred_audios, dim=-1)
+    processed_time = time.time() - begin_time
+    real_time_factor = processed_time / (total_wavlen / genVC_mdl.content_sample_rate)
+    print(f"Real-time factor: {real_time_factor:.3f}")
+    return synthesized_audio
+
+@torch.inference_mode()
+def synthesize_utt_streaming_mic2(
+    genVC_mdl, 
+    src_wav,
+    cond_latent,
+    stream_chunk_size=8):
+
+    wav_gen_prev, wav_overlap = None, None
+    
+    total_wavlen = src_wav.shape[-1]
+    pred_audios = []
+    min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate)
+
+    begin_time = time.time()
+
+    src_wav = src_wav.to(genVC_mdl.device)
+    is_begin = True
+
+    content_feat = genVC_mdl.content_extractor.extract_content_features(src_wav)
+    content_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
+    print("포네틱 토큰 개수:", content_codes.shape[1])
+    content_codes = content_codes[:, 1:] # 맨앞 토큰 하나 버림
+    gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_codes)
+
+    # 한번만 불러서 써먹어야함
+    gpt_generator = genVC_mdl.gpt.get_generator(
+        fake_inputs=gpt_inputs,
+        top_p=genVC_mdl.config.top_p,
+        top_k=genVC_mdl.config.top_k,
+        temperature=genVC_mdl.config.temperature,
+        length_penalty=genVC_mdl.config.length_penalty,
+        repetition_penalty=genVC_mdl.config.repetition_penalty,
+        do_sample=True,
+        num_beams=1,
+        num_return_sequences=1,
+        output_attentions=False,
+        output_hidden_states=True,
+    )
+
+    last_tokens = []
+    all_latents = []
+    is_end = False
+
+    #따로 안짰음. 스트림 청크사이즈 없애야함
+    while not is_end:
+        try:
+            x, latent = next(gpt_generator)
+            last_tokens += [x]
+            all_latents += [latent]
+        except StopIteration:
+            is_end = True
+
+        if is_end or (stream_chunk_size > 0 and len(last_tokens) >= stream_chunk_size):
+            if not len(last_tokens):
+                continue
+            acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
+            mel_input = torch.nn.functional.interpolate(
+                acoustic_latents.transpose(1, 2),
+                scale_factor=[genVC_mdl.hifigan_scale_factor],
+                mode="linear",
+            ).squeeze(1)
+            audio_pred = genVC_mdl.hifigan.forward(mel_input)
+            #음성이 매우짧기 때문에 1024로 오버랩하면 하나로 다 합쳐질것
+            wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+                audio_pred.squeeze(), wav_gen_prev, wav_overlap, 1024)
+            pred_audios.append(wav_chunk)
+            last_tokens = []
+            all_latents = []
+            if is_begin:
+                is_begin = False
+                latency = time.time() - begin_time
+                print(f"Latency: {latency:.3f}s")
     
     synthesized_audio = torch.cat(pred_audios, dim=-1)
     processed_time = time.time() - begin_time
