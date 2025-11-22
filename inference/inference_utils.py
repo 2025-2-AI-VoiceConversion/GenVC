@@ -136,7 +136,7 @@ def synthesize_utt_chunked(
 def synthesize_utt_streaming(
     genVC_mdl, 
     src_wav, 
-    tgt_audio, 
+    tgt_audio,
     seg_len=6.0,
     stream_chunk_size=8):
 
@@ -154,7 +154,6 @@ def synthesize_utt_streaming(
     tgt_audio = tgt_audio.to(genVC_mdl.device)
     cond_latent = genVC_mdl.get_gpt_cond_latents(tgt_audio, genVC_mdl.config.audio.sample_rate)
     is_begin = True
-    
     for i in range(0, total_wavlen, seg_len):
         seg_end = i+seg_len if i+seg_len < total_wavlen else total_wavlen
         if seg_end == total_wavlen:
