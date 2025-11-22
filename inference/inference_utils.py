@@ -216,31 +216,27 @@ def synthesize_utt_streaming(
     print(f"Real-time factor: {real_time_factor:.3f}")
     return synthesized_audio
 
-@torch.inference_mode()
-def synthesize_utt_streaming_mic2(
+@torch.inference_mode() 
+def synthesize_utt_streaming_mic(
     genVC_mdl, 
-    src_wav,
-    cond_latent,
+    src_wav, 
+    cond_latent, 
     stream_chunk_size=8):
 
     wav_gen_prev, wav_overlap = None, None
-    
-    total_wavlen = src_wav.shape[-1]
     pred_audios = []
     min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate)
 
     begin_time = time.time()
-
-    src_wav = src_wav.to(genVC_mdl.device)
     is_begin = True
-
+    
     content_feat = genVC_mdl.content_extractor.extract_content_features(src_wav)
     content_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
-    print("포네틱 토큰 개수:", content_codes.shape[1])
-    content_codes = content_codes[:, 1:] # 맨앞 토큰 하나 버림
+        
+    # 임베딩 제작 : [화자 프롬프트, 내용 문맥, START_AUDIO] 
     gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_codes)
 
-    # 한번만 불러서 써먹어야함
+    # GPT 제네레이터를 생성함 - 이 병목이 얼마나 오래 걸릴까? 
     gpt_generator = genVC_mdl.gpt.get_generator(
         fake_inputs=gpt_inputs,
         top_p=genVC_mdl.config.top_p,
@@ -258,8 +254,7 @@ def synthesize_utt_streaming_mic2(
     last_tokens = []
     all_latents = []
     is_end = False
-
-    #따로 안짰음. 스트림 청크사이즈 없애야함
+        
     while not is_end:
         try:
             x, latent = next(gpt_generator)
@@ -268,9 +263,8 @@ def synthesize_utt_streaming_mic2(
         except StopIteration:
             is_end = True
 
+        # 8개의 음성 토큰을 GPT가 만들어 내면, 보코더로 음성 조각을 만들어 리턴한다 
         if is_end or (stream_chunk_size > 0 and len(last_tokens) >= stream_chunk_size):
-            if not len(last_tokens):
-                continue
             acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
             mel_input = torch.nn.functional.interpolate(
                 acoustic_latents.transpose(1, 2),
@@ -278,19 +272,21 @@ def synthesize_utt_streaming_mic2(
                 mode="linear",
             ).squeeze(1)
             audio_pred = genVC_mdl.hifigan.forward(mel_input)
-            #음성이 매우짧기 때문에 1024로 오버랩하면 하나로 다 합쳐질것
+            
+            # 이거 안해도 되지 않냐 지금은? 뭔가 이거 처리도
+            
             wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
                 audio_pred.squeeze(), wav_gen_prev, wav_overlap, 1024)
+            
             pred_audios.append(wav_chunk)
+                
+            # Speak
             last_tokens = []
             all_latents = []
+                
             if is_begin:
                 is_begin = False
                 latency = time.time() - begin_time
                 print(f"Latency: {latency:.3f}s")
     
-    synthesized_audio = torch.cat(pred_audios, dim=-1)
-    processed_time = time.time() - begin_time
-    real_time_factor = processed_time / (total_wavlen / genVC_mdl.content_sample_rate)
-    print(f"Real-time factor: {real_time_factor:.3f}")
-    return synthesized_audio
+            return pred_audios # 8 tokens (0.34 Audio Length) 
