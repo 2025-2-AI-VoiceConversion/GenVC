@@ -248,7 +248,6 @@ def synthesize_utt_streaming_mic(
     is_begin = True
     
     t_gpt_start = time.time()
-
     # 총 chunk_size 개 만큼 반복합니다. 만약 chunk_size = 2라면 두개의 청크에 대해서 처리합니다. 
     for i in range(0, stream_chunk_size): 
         
