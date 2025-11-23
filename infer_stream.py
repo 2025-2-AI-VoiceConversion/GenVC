@@ -19,7 +19,7 @@ context_vector = None # Sliding Window [type : SSL Vector] # 현재 안쓰임.
 
 MAX_BUFFER_LEN = None 
 model = None
-config = None
+config = None 
 SAMPLE_RATE = None
 BLOCKSIZE = None 
 

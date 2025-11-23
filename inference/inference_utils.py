@@ -136,7 +136,7 @@ def synthesize_utt_chunked(
 def synthesize_utt_streaming(
     genVC_mdl, 
     src_wav, 
-    tgt_audio, 
+    tgt_audio,
     seg_len=6.0,
     stream_chunk_size=8):
 
@@ -154,7 +154,6 @@ def synthesize_utt_streaming(
     tgt_audio = tgt_audio.to(genVC_mdl.device)
     cond_latent = genVC_mdl.get_gpt_cond_latents(tgt_audio, genVC_mdl.config.audio.sample_rate)
     is_begin = True
-    
     for i in range(0, total_wavlen, seg_len):
         seg_end = i+seg_len if i+seg_len < total_wavlen else total_wavlen
         if seg_end == total_wavlen:
@@ -249,6 +248,7 @@ def synthesize_utt_streaming_mic(
     is_begin = True
     
     t_gpt_start = time.time()
+
     # 총 chunk_size 개 만큼 반복합니다. 만약 chunk_size = 2라면 두개의 청크에 대해서 처리합니다. 
     for i in range(0, stream_chunk_size): 
         
@@ -322,3 +322,305 @@ def synthesize_utt_streaming_mic(
                     
     # 일단 지금 구현은 6초만큼 생성하고 바로 넘겨주는 쓰레기 구현임.. 
     return pred_audios
+
+@torch.inference_mode() 
+def synthesize_utt_streaming_testflow(
+    genVC_mdl, 
+    input_tensor,
+    cond_latent, 
+    chunk_size, 
+    past_key_values=None, 
+    global_pos = 0,
+    last_audio_token=None,
+    ):
+    """
+    Stateful Streaming Inference Function
+    
+    Args:
+        genVC_mdl: GenVC model instance
+        input_tensor: Audio input [1, 1, S] (Includes past context + current chunk)
+        cond_latent: Speaker style embedding
+        chunk_size: The size of the 'new' audio chunk (in samples) to generate
+        past_key_values: KV Cache from previous step
+        global_pos: Current absolute position index for positional embedding
+        last_audio_token: The last generated audio token from previous step
+    
+    Returns:
+        wav_chunk (audio tensor), past_key_values, last_audio_token, global_pos
+    """ 
+    
+    # =========================================================================
+    # 0. Constants & Timing Setup
+    # =========================================================================
+    import time # 딜레이 로깅용 
+    
+    timing_log = {}
+    t_total_start = time.time()
+    
+    GPT_CODE_STRIDE = 1024 
+    tokens_to_generate = int(chunk_size / GPT_CODE_STRIDE) # chunk size 는 1024 배수여야 함 
+    
+    # 청크 사이즈가 너무 작아서 토큰을 만들 수 없는 경우 (예외처리)
+    if tokens_to_generate == 0:
+        print("[Error] chunk size is too small")
+        return None, past_key_values, last_audio_token, global_pos
+
+    device = input_tensor.device
+    gpt = genVC_mdl.gpt
+
+    # =========================================================================
+    # 1. Content Extraction [Audio Processing]
+    # =========================================================================
+    t1_start = time.time()
+    
+    # 1.1 Content Feature 추출 
+    # Note: extract_content_features expects (batch, T) shape
+    content_feat = genVC_mdl.content_extractor.extract_content_features(input_tensor)
+    
+    t1_feature = time.time()
+    timing_log['1_feature_extraction'] = (t1_feature - t1_start) * 1000  # ms
+    
+    # 1.2 Content Code 추출 (DVAE)
+    full_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
+    
+    t1_dvae = time.time()
+    timing_log['2_dvae_quantization'] = (t1_dvae - t1_feature) * 1000  # ms
+
+    # 1.3 Content Code 개수 계산하기 
+    '''
+        If 컨텍스트가 꽉 찬 상태
+        Else 아직 꽉 차지는 않은 상태 
+        분기 나눠서 정확히 처리할 수 있어야함. 지금 구현 바보구현 
+    '''
+    
+    # 1.4 이번 내용에만 딱 맞는 Content Code 슬라이싱
+    # 3청크 입력 중 맨 뒤(현재)에 해당하는 토큰만 가져옴
+    # 시간축 동기화를 위해 정확히 계산된 개수만큼 뒤에서 자름.
+    target_content_tokens = full_codes[:, -tokens_to_generate:]
+    
+    # =========================================================================
+    # 2. GPT 임베딩 준비 [Cond + Target_Content + Audio Prompt]
+    # =========================================================================
+    '''
+    목표 : 기존 KV Cache 뒤에 새로운 Text 를 붙인다. 
+    상황 : [Prompt ... Content A Audio A] + [Content B] 를 붙임 
+    '''
+
+    # 2-1-1. Content 임베딩
+    txt_emb = gpt.text_embedding(target_content_tokens) # [B, T, Dim]
+
+    # 2-1-2. Content Positional Embedding
+    seq_len = target_content_tokens.shape[1]
+    pos_ids_txt = torch.arange(global_pos, global_pos + seq_len, device=device) # 얘는 뭐임?
+    
+    # Positional Limit Clamping (학습된 길이를 초과하는 것을 방지) 
+    max_pos_txt = gpt.text_pos_embedding.emb.num_embeddings # 얘는 뭐임?
+    pos_ids_txt = torch.clamp(pos_ids_txt, max=max_pos_txt-1) # 얘는 뭐임? 
+
+    txt_pos = gpt.text_pos_embedding.emb(pos_ids_txt).unsqueeze(0)
+    emb_content = txt_emb + txt_pos
+
+    # 2-2 Input Embedding 구성 
+
+    # 2-2-1. 최초 실행 
+    if past_key_values is None:
+        inputs_embeds = torch.cat([cond_latent, emb_content], dim=1)
+        # Start Token 초기화
+        last_audio_token = torch.tensor([[gpt.start_audio_token]], device=device)
+    else:
+        # [스트리밍 중]: 이전 KV Cache 뒤에 이번 Content만 붙임 
+        inputs_embeds = emb_content
+
+    # 2-3. Forward (Text Prefill)
+    t2_prefill_start = time.time()
+    
+    out = gpt.gpt(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
+    past_key_values = out.past_key_values
+    
+    t2_prefill_end = time.time()
+    timing_log['3_kv_prefill'] = (t2_prefill_end - t2_prefill_start) * 1000  # ms
+    
+    '''
+    2.3 추가 설명 )
+
+    Before KVCache : [스타일 + 옛날 내용 + 옛날 음향]
+        [2.3 포워드 진행 후]
+    After KVCache : [스타일 + 옛날 내용 + 옛날 음향 + 이번 텍스트 내용]
+    '''
+    
+    # 2-4. 글로벌 커서 업데이트 (추가된 만큼) 
+    global_pos += inputs_embeds.shape[1] 
+
+    '''
+    3. GPT_Forward [Audio Generation]
+    목표: tokens_to_generate 만큼 오디오 토큰을 생성하면 된다. 
+    '''
+
+    # =========================================================================
+    # 3. GPT_Forward [Audio Generation]
+    # =========================================================================
+    t3_gpt_start = time.time()
+    
+    curr_token = last_audio_token
+    curr_pos = global_pos
+    all_latents = [] # for Vocoder
+
+    # Mel Head의 Positional Embedding 한계 
+    max_pos_mel = gpt.mel_pos_embedding.emb.num_embeddings
+
+    # (Generation Loop) 
+    for _ in range(tokens_to_generate):
+
+        # 3.1.1 Mel Embedding 
+        mel_emb = gpt.mel_embedding(curr_token)
+        
+        # 3.1.2. Positional Embedding 
+        p_id = torch.tensor([curr_pos], device=device) # 이게뭔데
+        p_id = torch.clamp(p_id, max=max_pos_mel-1) #이게 뭔데
+        mel_pos = gpt.mel_pos_embedding.emb(p_id).unsqueeze(0) # 위치 임베딩 얻기 
+
+        # 3.1.3. Mel Input Embedding 
+        curr_input = mel_emb + mel_pos 
+        
+        # 3.2. GPT Forward (Next Token Prediction)
+
+        # 이전 기억 past_key_values 와 현재 입력 curr_input 을 넣는다. 
+        out = gpt.gpt(inputs_embeds=curr_input, past_key_values=past_key_values, use_cache=True)
+        # 기억 업데이트 
+        past_key_values = out.past_key_values
+
+        # 3.3. Decode 
+        hidden = gpt.final_norm(out.last_hidden_state) # [1,1,Dim] ? 
+        logits = gpt.mel_head(hidden) # 히든에서 음성 헤드 꺼내기 
+        # * gpt.text_head(hidden) 내용 헤드꺼내면 pseudo context 구현 가능할듯. 
+
+        # stop token 방지 
+        stop_token_id = gpt.stop_audio_token
+        logits[:, :, stop_token_id] = -float('inf')
+
+        # 3.4. Greedy Sampling 
+        next_token = torch.argmax(logits, dim=-1) 
+
+        # 3.5 Setup for Next Prediction 
+        all_latents.append(hidden)
+        curr_token = next_token
+        curr_pos += 1
+
+        # 3.6 Stop Check 필요 
+
+        '''
+        모델이 인터리빙을 잘 이해하지 못하고 바로 end_token을 뱉는 상황에 대한 예외 처리 가능성이 필요할 수 있음 
+        ''' 
+        if next_token.item() == gpt.stop_audio_token:
+            print("End Token reached...")
+            break
+        
+    t3_gpt_end = time.time()
+    timing_log['4_gpt_generation'] = (t3_gpt_end - t3_gpt_start) * 1000  # ms
+    timing_log['4_gpt_per_token'] = (t3_gpt_end - t3_gpt_start) * 1000 / max(len(all_latents), 1)  # ms/token
+    
+    last_audio_token = curr_token 
+    # =========================================================================
+    # 4. Sliding Window KVCache
+    # =========================================================================
+    # 캐시가 너무 커지면 OOM 방지를 위해 앞을 자름
+
+    '''
+    # GPT-2 기반 모델의 MAX Context Window는 보통 2048 또는 4096입니다. 
+    # 안전하게 2000 토큰 정도만 유지하고 앞부분을 잘라냅니다.
+    MAX_CONTEXT_WINDOW = 2048 
+    
+    if past_key_values is not None:
+        # past_key_values 구조: (Layer 수, 2(Key,Value), Batch, Head, Seq_Len, Head_Dim)
+        # 튜플을 리스트로 변환하여 수정
+        new_kv = []
+        for layer_past in past_key_values:
+            # layer_past: (2, B, H, Seq_Len, Dim)
+            current_seq_len = layer_past.shape[3] # 3번째 인덱스가 시퀀스 길이
+            
+            if current_seq_len > MAX_CONTEXT_WINDOW:
+                # 앞부분을 잘라내고 뒤쪽(최신)만 남김
+                # [..., -MAX_CONTEXT_WINDOW:, :]
+                pruned_layer = layer_past[:, :, :, -MAX_CONTEXT_WINDOW:, :]
+                new_kv.append(pruned_layer)
+            else:
+                new_kv.append(layer_past)
+        
+        past_key_values = tuple(new_kv)
+    '''
+    
+    # =========================================================================
+    # 5. Vocoding (HiFi-GAN)
+    # =========================================================================
+    t4_vocoder_start = time.time()
+
+    if len(all_latents) == 0:
+        print("Warning: No audio generated. Returning None.")
+        return None, past_key_values, last_audio_token, global_pos
+
+    # 5.1 Acoustic Latent 제작  
+    acoustic_latents = torch.cat(all_latents, dim=1) # [B, tokens_to_generate, Dim]
+    
+    '''
+    gpt_code_stride_len = 1024 로 음성 토큰 1개당 오디오 1024샘플이다.
+    hop_length = 256 으로 하이파이갠 홉 사이즈는 256.
+    즉 4배의 시간 해상도 차이가 존재한다. 
+    1GPT token = 4 Mel frame 이다. 
+
+    원본 GPT 토큰:    [A]             [B]                 [C]          [D]
+                       ↓                ↓                ↓           ↓
+    보간 후:        [A] [a1][a2][a3][B][b1][b2][b3][C][c1][c2][c3][D]...
+                      └─────┘          └─────┘        └─────┘
+                      4 frames         4 frames      4 frames
+    '''
+    # 5.2 선형 보간을 활용해서 Mel Input (to Vocoder)
+    mel_input = torch.nn.functional.interpolate(
+        acoustic_latents.transpose(1, 2),
+        scale_factor=[genVC_mdl.hifigan_scale_factor],
+        mode="linear",
+    ).squeeze(1)
+    
+    # 5.3 Hifi-GAN 음성 합성 
+    wav_chunk = genVC_mdl.hifigan.forward(mel_input).squeeze()
+    
+    t4_vocoder_end = time.time()
+    timing_log['5_vocoding'] = (t4_vocoder_end - t4_vocoder_start) * 1000  # ms
+    
+    # =========================================================================
+    # 6. Timing Summary
+    # =========================================================================
+    t_total_end = time.time()
+    timing_log['total_time'] = (t_total_end - t_total_start) * 1000  # ms
+    
+    # 로그 출력 (Fast I/O)
+    import sys
+    
+    # RTF 계산 (Real-Time Factor)
+    audio_duration_ms = (chunk_size / 24000) * 1000  # 24kHz sample rate
+    rtf = timing_log['total_time'] / audio_duration_ms
+    
+    # 한 번에 문자열 생성 후 출력 (버퍼링 최소화)
+    log_output = (
+        f"\n[⏱️  Timing Log - Chunk {chunk_size} samples]\n"
+        f"  1️⃣  Feature Extraction:  {timing_log['1_feature_extraction']:6.2f} ms\n"
+        f"  2️⃣  DVAE Quantization:   {timing_log['2_dvae_quantization']:6.2f} ms\n"
+        f"  3️⃣  KV Cache Prefill:    {timing_log['3_kv_prefill']:6.2f} ms\n"
+        f"  4️⃣  GPT Generation:      {timing_log['4_gpt_generation']:6.2f} ms ({timing_log['4_gpt_per_token']:.2f} ms/token)\n"
+        f"  5️⃣  Vocoding (HiFiGAN):  {timing_log['5_vocoding']:6.2f} ms\n"
+        f"  {'─'*50}\n"
+        f"  🔥 Total:               {timing_log['total_time']:6.2f} ms\n"
+        f"  📊 RTF (Real-Time Factor): {rtf:.3f}\n\n"
+    )
+    
+    sys.stdout.write(log_output)
+    sys.stdout.flush()
+    
+    
+    # 5.5 Cross-Fading Overlap 구현
+    '''
+    wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+        wav_chunk, wav_gen_prev, wav_overlap, overlap_len=1024
+    )
+    '''             
+    return wav_chunk, past_key_values, last_audio_token, global_pos 
+
