@@ -14,35 +14,57 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1600*15 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 1600*20 # 이걸 올리면 퀄리티가 올라갈거
         self.ref_audio = ref_audio
         self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
         self.FUTURE_CHUNK = 2
 
+        # [수정 1] 비동기 처리를 위한 데이터 큐 생성
+        self.input_queue = queue.Queue()
+        self.output_queue = queue.Queue()
+
+        # [수정 2] 콜백 함수 정의 (입력용/출력용)
+        def input_callback(in_data, frame_count, time_info, status):
+            self.input_queue.put(in_data) # 들어온 오디오를 큐에 쌓음
+            return (None, pyaudio.paContinue)
+
+        def output_callback(in_data, frame_count, time_info, status):
+            try:
+                data = self.output_queue.get_nowait()
+            except queue.Empty:
+                data = b'\x00' * frame_count * 4 
+            return (data, pyaudio.paContinue)
+
+
         self.input_stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=1,
             rate=input_rate,
             input=True,
-            frames_per_buffer=self.chunk
+            frames_per_buffer=self.chunk,
+            stream_callback=input_callback
         )
 
         self.output_stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=1,
             rate=output_rate,
-            output=True
+            output=True,
+            frames_per_buffer=self.chunk,
+            stream_callback=output_callback
         )
 
     def start(self):
         print("곧 시작합니다")
+        self.input_stream.start_stream()
+        self.output_stream.start_stream()
         try:
             # while문으로 계속 '입력버퍼 확인->변환->출력' 반복
             # 변환이 오래걸리면 인생 망함(RTF>1)
             while True:
-                in_data = self.input_stream.read(self.chunk, exception_on_overflow=False)
+                in_data = self.input_queue.get()
                 
                 input_np = np.frombuffer(in_data, dtype=np.float32).copy()
                 input_np *= 15 # 소리가 너무 작아서 올렸는데 귀터짐 주의
@@ -66,7 +88,7 @@ class StreamingBuffer:
                         continue
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
-                self.output_stream.write(output_np.tobytes())
+                self.output_queue.put(output_np.tobytes())
 
         except KeyboardInterrupt:
             # 닫기
