@@ -14,41 +14,64 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1600 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 1600*20 # 이걸 올리면 퀄리티가 올라갈거
         self.ref_audio = ref_audio
-        self.ref_audio = self.ref_audio.to(self.device)
+        self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
+        self.FUTURE_CHUNK = 2
+
+        # [수정 1] 비동기 처리를 위한 데이터 큐 생성
+        self.input_queue = queue.Queue()
+        self.output_queue = queue.Queue()
+
+        # [수정 2] 콜백 함수 정의 (입력용/출력용)
+        def input_callback(in_data, frame_count, time_info, status):
+            self.input_queue.put(in_data) # 들어온 오디오를 큐에 쌓음
+            return (None, pyaudio.paContinue)
+
+        def output_callback(in_data, frame_count, time_info, status):
+            try:
+                data = self.output_queue.get_nowait()
+            except queue.Empty:
+                data = b'\x00' * frame_count * 4 
+            return (data, pyaudio.paContinue)
+
 
         self.input_stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=1,
             rate=input_rate,
             input=True,
-            frames_per_buffer=self.chunk
+            frames_per_buffer=self.chunk,
+            stream_callback=input_callback
         )
 
         self.output_stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=1,
             rate=output_rate,
-            output=True
+            output=True,
+            frames_per_buffer=self.chunk,
+            stream_callback=output_callback
         )
 
     def start(self):
         print("곧 시작합니다")
+        self.input_stream.start_stream()
+        self.output_stream.start_stream()
         try:
             # while문으로 계속 '입력버퍼 확인->변환->출력' 반복
             # 변환이 오래걸리면 인생 망함(RTF>1)
             while True:
-                in_data = self.input_stream.read(self.chunk, exception_on_overflow=False)
+                in_data = self.input_queue.get()
                 
                 input_np = np.frombuffer(in_data, dtype=np.float32).copy()
-                input_np *= 15 # 소리가 너무 작음
+                input_np *= 15 # 소리가 너무 작아서 올렸는데 귀터짐 주의
                 current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
                 
                 # 버퍼에 있는 데이터 + 현재 데이터
-                padding_size = (2 - len(self.context_buffer)) * self.chunk
+                padding_size = (self.FUTURE_CHUNK - len(self.context_buffer)) * self.chunk
                 if self.context_buffer:
                     input_tensor = torch.cat(self.context_buffer + [current_tensor], dim=1)
                 else:
@@ -56,7 +79,7 @@ class StreamingBuffer:
                 input_tensor = torch.nn.functional.pad(input_tensor, (padding_size, 0), "constant", 0)
                 
                 self.context_buffer.append(current_tensor)
-                if len(self.context_buffer) > 2:
+                if len(self.context_buffer) > self.FUTURE_CHUNK:
                     self.context_buffer.pop(0)
 
                 with torch.no_grad():
@@ -65,7 +88,7 @@ class StreamingBuffer:
                         continue
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
-                self.output_stream.write(output_np.tobytes())
+                self.output_queue.put(output_np.tobytes())
 
         except KeyboardInterrupt:
             # 닫기
