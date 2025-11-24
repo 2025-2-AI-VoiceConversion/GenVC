@@ -414,6 +414,10 @@ def synthesize_utt_streaming_testflow(
     
     # Positional Limit Clamping (학습된 길이를 초과하는 것을 방지) 
     max_pos_txt = gpt.text_pos_embedding.emb.num_embeddings # 얘는 뭐임?
+
+    if((global_pos + seq_len) >= max_pos_txt):
+                print(f"[WARNING] Text Positional Limit Reached! Current: {global_pos + seq_len}, Max: {max_pos_txt}")
+
     pos_ids_txt = torch.clamp(pos_ids_txt, max=max_pos_txt-1) # 얘는 뭐임? 
 
     txt_pos = gpt.text_pos_embedding.emb(pos_ids_txt).unsqueeze(0)
@@ -463,7 +467,7 @@ def synthesize_utt_streaming_testflow(
     curr_token = last_audio_token
     curr_pos = global_pos
     all_latents = [] # for Vocoder
-
+    all_tokens = []
     # Mel Head의 Positional Embedding 한계 
     max_pos_mel = gpt.mel_pos_embedding.emb.num_embeddings
 
@@ -475,6 +479,10 @@ def synthesize_utt_streaming_testflow(
         
         # 3.1.2. Positional Embedding 
         p_id = torch.tensor([curr_pos], device=device) # 이게뭔데
+    
+        if(curr_pos >= max_pos_mel):
+            print(f"[WARNING] Mel Positional Limit Reached! Current: {curr_pos}, Max: {max_pos_mel}")
+
         p_id = torch.clamp(p_id, max=max_pos_mel-1) #이게 뭔데
         mel_pos = gpt.mel_pos_embedding.emb(p_id).unsqueeze(0) # 위치 임베딩 얻기 
 
@@ -493,12 +501,36 @@ def synthesize_utt_streaming_testflow(
         logits = gpt.mel_head(hidden) # 히든에서 음성 헤드 꺼내기 
         # * gpt.text_head(hidden) 내용 헤드꺼내면 pseudo context 구현 가능할듯. 
 
+        # =================================================================
+        # [🛡️ Safety Net] 모델 멘탈 상태 점검 (Confidence & Entropy)
+        # =================================================================
+        
+        # 1. 확률 분포 계산 (Softmax)
+        probs = torch.nn.functional.softmax(logits, dim=-1) # [1, 1, Vocab]
+        
+        # 2. 주요 지표 추출
+        # (1) 1등 토큰과 그 확신도(Confidence)
+        top_prob, top_id = torch.max(probs, dim=-1)
+        top_prob = top_prob.item() # 0.0 ~ 1.0
+        
+        # (2) Stop Token 확신도
+        stop_id = getattr(gpt, 'stop_audio_token', 8195)
+        stop_prob = probs[0, 0, stop_id].item()
+        
+        # (3) 엔트로피 (혼란도) 계산
+        # P * log(P)의 합. 높을수록 혼란스러움.
+        # 1e-9는 log(0) 방지용
+        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).item()
+
+        print(f"Confidence: {top_prob:.4f}, Stop Confidence: {stop_prob:.4f}, Entropy: {entropy:.4f}")
+
         # stop token 방지 
-        stop_token_id = gpt.stop_audio_token
-        logits[:, :, stop_token_id] = -float('inf')
+        # stop_token_id = gpt.stop_audio_token
+        # logits[:, :, stop_token_id] = -float('inf')
 
         # 3.4. Greedy Sampling 
         next_token = torch.argmax(logits, dim=-1) 
+        all_tokens.append(next_token.item())
 
         # 3.5 Setup for Next Prediction 
         all_latents.append(hidden)
@@ -512,6 +544,8 @@ def synthesize_utt_streaming_testflow(
         ''' 
         if next_token.item() == gpt.stop_audio_token:
             print("End Token reached...")
+            #TODO: 중단된 상태에서 토큰을 얼마나 많이 만들었었는지 출력 
+            print(f"Generated {len(all_latents)}, {len(all_tokens)} tokens before end token. goal: {tokens_to_generate}")
             break
         
     t3_gpt_end = time.time()
@@ -520,34 +554,41 @@ def synthesize_utt_streaming_testflow(
     
     last_audio_token = curr_token 
     # =========================================================================
-    # 4. Sliding Window KVCache
+    # 4. Sliding Window KVCache - 구현 해야함. 
     # =========================================================================
     # 캐시가 너무 커지면 OOM 방지를 위해 앞을 자름
 
-    '''
-    # GPT-2 기반 모델의 MAX Context Window는 보통 2048 또는 4096입니다. 
-    # 안전하게 2000 토큰 정도만 유지하고 앞부분을 잘라냅니다.
-    MAX_CONTEXT_WINDOW = 2048 
+    NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
+    KEEP_RECENT_TOKENS = 100
+
+    MAX_WINDOW = NUM_STYLE_TOKENS + KEEP_RECENT_TOKENS
     
+    #TODO: layer_past shape 로깅으로 실제 검증 확인하기 
     if past_key_values is not None:
-        # past_key_values 구조: (Layer 수, 2(Key,Value), Batch, Head, Seq_Len, Head_Dim)
-        # 튜플을 리스트로 변환하여 수정
-        new_kv = []
-        for layer_past in past_key_values:
-            # layer_past: (2, B, H, Seq_Len, Dim)
-            current_seq_len = layer_past.shape[3] # 3번째 인덱스가 시퀀스 길이
-            
-            if current_seq_len > MAX_CONTEXT_WINDOW:
-                # 앞부분을 잘라내고 뒤쪽(최신)만 남김
-                # [..., -MAX_CONTEXT_WINDOW:, :]
-                pruned_layer = layer_past[:, :, :, -MAX_CONTEXT_WINDOW:, :]
-                new_kv.append(pruned_layer)
-            else:
-                new_kv.append(layer_past)
+        # past_key_values[0]은 (Key, Value) 튜플임
+        # Key Shape: (Batch, Num_Heads, Seq_Len, Head_Dim) -> Index 2가 Seq_Len
+        current_seq_len = past_key_values[0][0].shape[2] 
         
-        past_key_values = tuple(new_kv)
-    '''
-    
+        if current_seq_len > MAX_WINDOW:
+            new_kv = []
+            for layer_past in past_key_values: 
+                # layer_past: (Key, Value)
+                k, v = layer_past
+                
+                # 1. Key Pruning
+                k_style = k[:, :, :NUM_STYLE_TOKENS, :]
+                k_recent = k[:, :, -KEEP_RECENT_TOKENS:, :]
+                k_pruned = torch.cat([k_style, k_recent], dim=2)
+                
+                # 2. Value Pruning
+                v_style = v[:, :, :NUM_STYLE_TOKENS, :]
+                v_recent = v[:, :, -KEEP_RECENT_TOKENS:, :]
+                v_pruned = torch.cat([v_style, v_recent], dim=2)
+                
+                new_kv.append((k_pruned, v_pruned))
+            
+            past_key_values = tuple(new_kv)
+        
     # =========================================================================
     # 5. Vocoding (HiFi-GAN)
     # =========================================================================
