@@ -159,11 +159,12 @@ if __name__ == '__main__':
     parser.add_argument('--ref_audio', type=str, default='samples/EF4_ENG_0112_1.wav')
     parser.add_argument('--output_path', type=str, default='samples/converted.wav')
     parser.add_argument('--top_k', type=int, default=15)
-    parser.add_argument('--streaming', type=bool, default=False)
-    parser.add_argument('--test', type=bool, default=False)
+    parser.add_argument('--streaming', type=str, default='0')
+    parser.add_argument('--test', type=str, default='0')
 
     args = parser.parse_args()
-
+    args.streaming = args.streaming == '1'
+    args.test = args.test == '1'
     model, config = model_init(args.model_path, args.device)
 
     # top_k is one of the important hyperparameters for inference, so you can tune it to get better results
