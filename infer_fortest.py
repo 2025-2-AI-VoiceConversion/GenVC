@@ -23,7 +23,9 @@ class StreamingBuffer:
         self.FUTURE_CHUNK = 2
         if(args.test): self.FUTURE_CHUNK = 0
         input_info = self.p.get_default_input_device_info()
-        input_rate = 24000 
+
+        input_rate = 24000
+        if(args.test and not args.streaming): input_rate = 96000
         output_rate = 24000
 
 
@@ -129,16 +131,22 @@ class StreamingBuffer:
             self.p.terminate()
 
     def start_for_nonstreaming(self, src_wav):
+
+        # --- 상태 변수 ---
+        past_key_values = None 
+        global_pos = 0
+        last_audio_token = None 
+        # ---------------
+
         # 파일 읽고 변환
         self.output_stream.start_stream()
         src_wav = src_wav.to(self.device)
         for i in range(0, src_wav.shape[1], self.chunk):
             self.input_queue.put(src_wav[:, i:i + self.chunk])
-            
         try:
             while True:
                 current_tensor = self.input_queue.get()
-                if current_tensor.shape[1] == 0 or self.input_queue.empty():
+                if current_tensor.size(1) == 0 or self.input_queue.empty():
                     time.sleep(5)
                     break
 
@@ -153,11 +161,17 @@ class StreamingBuffer:
                 self.context_buffer.append(current_tensor)
                 if len(self.context_buffer) > self.FUTURE_CHUNK:
                     self.context_buffer.pop(0)
-                    
-                with torch.no_grad(): 
-                    converted_tensor = synthesize_utt_streaming_v2(self.model, input_tensor, self.cond_latent)
-                    if(converted_tensor is None):
-                        continue
+
+                with torch.no_grad():
+                    converted_tensor, past_key_values, last_audio_token, global_pos = synthesize_utt_streaming_testflow(
+                        self.model, 
+                        input_tensor, # [1,1,chunksize * 3]
+                        self.cond_latent,
+                        self.chunk,
+                        past_key_values,
+                        global_pos,
+                        last_audio_token
+                    )
 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
