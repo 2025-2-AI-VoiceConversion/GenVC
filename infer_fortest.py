@@ -1,5 +1,5 @@
 from inference.model_init import model_init
-from inference.inference_utils import synthesize_utt_streaming_testflow, synthesize_utt_streaming
+from inference.inference_utils import synthesize_utt_streaming, synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2
 from utils import load_audio
 import torch
 import torchaudio
@@ -14,7 +14,7 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1600 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 1024*8 # 이걸 올리면 퀄리티가 올라갈거
         if(args.test): self.chunk = 16000
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
@@ -23,15 +23,11 @@ class StreamingBuffer:
         self.FUTURE_CHUNK = 2
         if(args.test): self.FUTURE_CHUNK = 0
         input_info = self.p.get_default_input_device_info()
-
         input_rate = 24000
-        if(args.test and not args.streaming): input_rate = 96000
         output_rate = 24000
-
 
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
-
 
         def input_callback(in_data, frame_count, time_info, status):
             self.input_queue.put(in_data) # 들어온 오디오를 큐에 쌓음
@@ -44,8 +40,7 @@ class StreamingBuffer:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
 
-        if(args.test and args.streaming):
-            #test, streaming은 파일 읽기
+        if(args.test and not args.streaming):
             pass
         else:
             self.input_stream = self.p.open(
@@ -116,9 +111,9 @@ class StreamingBuffer:
                         last_audio_token
                         )
 
-                    if(converted_tensor is None):
-                        continue 
-
+                        if(converted_tensor is None):
+                            continue
+                
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
 
@@ -131,13 +126,6 @@ class StreamingBuffer:
             self.p.terminate()
 
     def start_for_nonstreaming(self, src_wav):
-
-        # --- 상태 변수 ---
-        past_key_values = None 
-        global_pos = 0
-        last_audio_token = None 
-        # ---------------
-
         # 파일 읽고 변환
         self.output_stream.start_stream()
         src_wav = src_wav.to(self.device)
@@ -163,15 +151,10 @@ class StreamingBuffer:
                     self.context_buffer.pop(0)
 
                 with torch.no_grad():
-                    converted_tensor, past_key_values, last_audio_token, global_pos = synthesize_utt_streaming_testflow(
-                        self.model, 
-                        input_tensor, # [1,1,chunksize * 3]
-                        self.cond_latent,
-                        self.chunk,
-                        past_key_values,
-                        global_pos,
-                        last_audio_token
-                    )
+                    converted_tensor = synthesize_utt_streaming_v2(self.model, input_tensor, self.cond_latent)
+                    if(converted_tensor is None):
+                        continue
+                
 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
