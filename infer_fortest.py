@@ -14,7 +14,7 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1024*8 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 1600 # 이걸 올리면 퀄리티가 올라갈거
         if(args.test): self.chunk = 16000
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
