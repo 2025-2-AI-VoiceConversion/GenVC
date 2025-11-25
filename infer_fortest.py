@@ -23,7 +23,7 @@ class StreamingBuffer:
         self.FUTURE_CHUNK = 2
         if(args.test): self.FUTURE_CHUNK = 0
         input_info = self.p.get_default_input_device_info()
-        input_rate = int(input_info['defaultSampleRate'])
+        input_rate = 24000
         output_rate = 24000
 
 
@@ -42,8 +42,7 @@ class StreamingBuffer:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
 
-        if(args.test and not streaming):
-            #test, non-streaming은 파일 읽기
+        if(args.test and not args.streaming):
             pass
         else:
             self.input_stream = self.p.open(
@@ -114,11 +113,10 @@ class StreamingBuffer:
         src_wav = src_wav.to(self.device)
         for i in range(0, src_wav.shape[1], self.chunk):
             self.input_queue.put(src_wav[:, i:i + self.chunk])
-            
         try:
             while True:
                 current_tensor = self.input_queue.get()
-                if current_tensor.shape[1] == 0 or self.input_queue.empty():
+                if current_tensor.size(1) == 0 or self.input_queue.empty():
                     time.sleep(5)
                     break
 
