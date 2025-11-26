@@ -1,5 +1,5 @@
 from inference.model_init import model_init
-from inference.inference_utils import synthesize_utt_streaming_v2
+from inference.inference_utils import synthesize_utt_streaming, synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2
 from utils import load_audio
 import torch
 import torchaudio
@@ -14,7 +14,7 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 16000 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 1600*4 # 이걸 올리면 퀄리티가 올라갈거 
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
@@ -23,7 +23,6 @@ class StreamingBuffer:
         input_rate = 24000 
         output_rate = 24000
 
-
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
         self.writer = None
@@ -31,7 +30,6 @@ class StreamingBuffer:
         if(args.save_audio):
             self.writer = torchaudio.io.StreamWriter(args.output_path)
             self.writer.add_audio_stream(sample_rate=output_rate, num_channels=1)
-
 
         def input_callback(in_data, frame_count, time_info, status):
             self.input_queue.put(in_data) # 들어온 오디오를 큐에 쌓음
@@ -43,7 +41,6 @@ class StreamingBuffer:
             except queue.Empty:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
-
         if(args.mode == 'file_stream'):
             pass
         else:
@@ -110,7 +107,16 @@ class StreamingBuffer:
                     converted_tensor = current_tensor
                 elif(args.mode == 'live_stream' or args.mode == 'file_stream'):
                     with torch.no_grad():
-                        converted_tensor = synthesize_utt_streaming_v2(self.model, input_tensor, self.cond_latent)
+                        converted_tensor, past_key_values, last_audio_token, global_pos = synthesize_utt_streaming_testflow(
+                        self.model, 
+                        input_tensor, # [1,1,chunksize * 3]
+                        self.cond_latent,
+                        self.chunk,
+                        past_key_values,
+                        global_pos,
+                        last_audio_token
+                        )
+
                         if(converted_tensor is None):
                             continue
                 
@@ -119,6 +125,12 @@ class StreamingBuffer:
 
                 if writer_stream is not None:
                     writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
+
+            # 모든 청크를 연결하여 최종 오디오 생성
+            if audio_chunks:
+                final_audio = torch.cat(audio_chunks, dim=0)
+                output_path = 'samples/converted_file_streaming.wav'
+                torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
 
         except KeyboardInterrupt:
             print("종료")

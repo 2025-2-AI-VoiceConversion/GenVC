@@ -855,6 +855,30 @@ class NewGenerationMixin(GenerationMixin):
 
             # sample
             probs = nn.functional.softmax(next_token_scores, dim=-1)
+            
+            # =================================================================
+            # [🛡️ Safety Net] 모델 멘탈 상태 점검 (Confidence & Entropy)
+            # =================================================================
+            # 1. 주요 지표 추출
+            # (1) 1등 토큰과 그 확신도(Confidence)
+            top_prob, top_id = torch.max(probs, dim=-1)
+            top_prob = top_prob.item()  # 0.0 ~ 1.0
+            
+            # (2) Stop Token 확신도 (vocab_size 범위 내에서만 계산)
+            vocab_size = probs.shape[-1]
+            stop_id = getattr(self, 'stop_audio_token', None)
+            if stop_id is not None and stop_id < vocab_size:
+                stop_prob = probs[0, stop_id].item()
+            else:
+                stop_prob = 0.0  # vocab 범위 밖이면 0으로 설정
+            
+            # (3) 엔트로피 (혼란도) 계산
+            # P * log(P)의 합. 높을수록 혼란스러움.
+            # 1e-9는 log(0) 방지용
+            entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).item()
+            
+            print(f"Confidence: {top_prob:.4f}, Stop Confidence: {stop_prob:.4f}, Entropy: {entropy:.4f}")
+            
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
             # finished sentences should have their next token be a padding token
