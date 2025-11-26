@@ -6,7 +6,7 @@ import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='pre_trained/GenVC_large.pth')
+    parser.add_argument('--model_path', type=str, default='pre_trained/GenVC_small.pth')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--src_wav', type=str, default='samples/EF4_ENG_0112_1.wav')
     parser.add_argument('--ref_audio', type=str, default='samples/EM1_ENG_0037_1.wav')
