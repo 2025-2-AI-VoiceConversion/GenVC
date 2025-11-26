@@ -439,7 +439,10 @@ def synthesize_utt_streaming_testflow(
     t_total_start = time.time()
     
     GPT_CODE_STRIDE = 1024 
-    tokens_to_generate = int(chunk_size / GPT_CODE_STRIDE) # chunk size 는 1024 배수여야 함 
+    SCALE_FACTOR = 1.5 # 24000 / 16000 
+
+    expected_chunk_size = int(chunk_size * SCALE_FACTOR)
+    tokens_to_generate = int(expected_chunk_size / GPT_CODE_STRIDE) 
     
     # 청크 사이즈가 너무 작아서 토큰을 만들 수 없는 경우 (예외처리)
     if tokens_to_generate == 0:
@@ -561,7 +564,6 @@ def synthesize_utt_streaming_testflow(
     max_pos_mel = gpt.mel_pos_embedding.emb.num_embeddings
 
     # test
-    tokens_to_generate = chunk_size // 1024
     print("[Forward] 생성할 Acoustics Tokens 수 :", tokens_to_generate)
 
     # (Generation Loop) 
@@ -618,8 +620,7 @@ def synthesize_utt_streaming_testflow(
         print(f"Confidence: {top_prob:.4f}, Stop Confidence: {stop_prob:.4f}, Entropy: {entropy:.4f}")
 
         # stop token 방지 
-        # stop_token_id = gpt.stop_audio_token
-        # logits[:, :, stop_token_id] = -float('inf')
+        logits[:, :, gpt.stop_audio_token] = -float('inf')
 
         # 3.4. Greedy Sampling 
         next_token = torch.argmax(logits, dim=-1) 
@@ -657,6 +658,7 @@ def synthesize_utt_streaming_testflow(
     # =========================================================================
     # 캐시가 너무 커지면 OOM 방지를 위해 앞을 자름
 
+    '''
     NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
     KEEP_RECENT_TOKENS = 100
 
@@ -687,7 +689,7 @@ def synthesize_utt_streaming_testflow(
                 new_kv.append((k_pruned, v_pruned))
             
             past_key_values = tuple(new_kv)
-        
+    '''
     # =========================================================================
     # 5. Vocoding (HiFi-GAN)
     # =========================================================================

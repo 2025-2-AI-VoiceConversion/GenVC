@@ -14,7 +14,7 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 16000 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 5120*2 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
@@ -23,16 +23,18 @@ class StreamingBuffer:
         self.past_key_values = None 
         self.global_pos = 0
         self.last_audio_token = None
-        self.input_rate = 24000 
+        self.input_rate = 16000
         self.output_rate = 24000
+        self.audio_chunks = []
 
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
-        self.writer = None
+        #self.writer = None
         
         if(args.save_audio):
-            self.writer = torchaudio.io.StreamWriter(args.output_path)
-            self.writer.add_audio_stream(sample_rate=output_rate, num_channels=1)
+            pass 
+            #self.writer = torchaudio.io.StreamWriter(args.output_path)
+            #self.writer.add_audio_stream(sample_rate=output_rate, num_channels=1)
 
 
         def input_callback(in_data, frame_count, time_info, status):
@@ -74,13 +76,19 @@ class StreamingBuffer:
         elif(args.mode == 'file_stream'):
             src_wav = src_wav.to(self.device)
             for i in range(0, src_wav.shape[1], self.chunk):
-                self.input_queue.put(src_wav[:, i:i + self.chunk])
+
+                chunk = src_wav[:, i:i + self.chunk]
+                print("chunk.shape : ", chunk.shape)
+                if chunk.shape[1] < self.chunk:
+                    chunk = torch.nn.functional.pad(chunk, (0, self.chunk - chunk.shape[1]))
+                    print("chunk.shape (modified) : ", chunk.shape)
+                self.input_queue.put(chunk)
         
         self.output_stream.start_stream()
         
-        writer_stream = None
-        if self.writer is not None:
-            writer_stream = self.writer.open()
+        #writer_stream = None
+        #if self.writer is not None:
+        #    writer_stream = self.writer.open()
         
         try:
             while True:
@@ -124,17 +132,17 @@ class StreamingBuffer:
 
                         if(converted_tensor is None):
                             continue
-
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
+                if(args.save_audio):
+                    self.audio_chunks.append(converted_tensor)
 
-                if writer_stream is not None:
-                    writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
-            # 모든 청크를 연결하여 최종 오디오 생성
-            if audio_chunks:
-                print("log : ", log)
-                final_audio = torch.cat(audio_chunks, dim=0)
+                #if writer_stream is not None:
+                #    writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
+
+            if self.audio_chunks:
+                final_audio = torch.cat(self.audio_chunks, dim=0)
                 output_path = 'samples/converted_file_streaming.wav'
                 torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
 
@@ -149,8 +157,8 @@ class StreamingBuffer:
             self.output_stream.close()
             self.p.terminate()
             
-            if writer_stream is not None:
-                writer_stream.close()
+            #if writer_stream is not None:
+            #    writer_stream.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -171,7 +179,7 @@ if __name__ == '__main__':
     # top_k is one of the important hyperparameters for inference, so you can tune it to get better results
     # for streaming inference, greedy decoding is preferred, you can set top_k to 1
     model.config.top_k = args.top_k
-    src_wav = load_audio(args.src_wav, model.config.content_sample_rate)
+    src_wav = load_audio(args.src_wav, model.content_sample_rate) 
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
     if args.mode == 'echo' or args.mode == 'live_stream' or args.mode == 'file_stream':
