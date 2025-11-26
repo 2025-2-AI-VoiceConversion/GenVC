@@ -1,5 +1,5 @@
 from inference.model_init import model_init
-from inference.inference_utils import synthesize_utt_streaming, synthesize_utt_streaming_v2
+from inference.inference_utils import synthesize_utt_streaming_v2
 from utils import load_audio
 import torch
 import torchaudio
@@ -14,16 +14,13 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1600 # 이걸 올리면 퀄리티가 올라갈거
-        if(args.test): self.chunk = 16000
+        self.chunk = 16000 # 이걸 올리면 퀄리티가 올라갈거
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
-        self.FUTURE_CHUNK = 2
-        if(args.test): self.FUTURE_CHUNK = 0
-        input_info = self.p.get_default_input_device_info()
-        input_rate = 24000
+        self.FUTURE_CHUNK = 0
+        input_rate = 24000 
         output_rate = 24000
 
 
@@ -42,7 +39,7 @@ class StreamingBuffer:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
 
-        if(args.test and not args.streaming):
+        if(args.mode == 'file_stream'):
             pass
         else:
             self.input_stream = self.p.open(
@@ -72,7 +69,6 @@ class StreamingBuffer:
                 in_data = self.input_queue.get()
                 
                 input_np = np.frombuffer(in_data, dtype=np.float32).copy()
-                input_np *= 15 # 소리가 너무 작아서 올렸는데 귀터짐 주의
                 current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
                 
                 # 버퍼에 있는 데이터 + 현재 데이터
@@ -88,11 +84,11 @@ class StreamingBuffer:
                     self.context_buffer.pop(0)
 
                 # 이거지우면 변환함수 돌아감
-                if(args.test): 
+                if(args.mode == 'echo'):
                     converted_tensor = current_tensor
                 else:
                     with torch.no_grad():
-                        converted_tensor = synthesize_utt_streaming(self.model, input_tensor, self.cond_latent)
+                        converted_tensor = synthesize_utt_streaming_v2(self.model, input_tensor, self.cond_latent)
                         if(converted_tensor is None):
                             continue
                 
@@ -157,12 +153,11 @@ if __name__ == '__main__':
     parser.add_argument('--ref_audio', type=str, default='samples/EF4_ENG_0112_1.wav')
     parser.add_argument('--output_path', type=str, default='samples/converted.wav')
     parser.add_argument('--top_k', type=int, default=15)
-    parser.add_argument('--streaming', type=str, default='0')
-    parser.add_argument('--test', type=str, default='0')
-
+    parser.add_argument('--mode', type=str, default='file_stream')
+    # mode = default, file_stream, live_stream, echo
+    
     args = parser.parse_args()
-    args.streaming = args.streaming == '1'
-    args.test = args.test == '1'
+    args.mode = args.mode.strip()
     model, config = model_init(args.model_path, args.device)
 
     # top_k is one of the important hyperparameters for inference, so you can tune it to get better results
@@ -171,15 +166,13 @@ if __name__ == '__main__':
     src_wav = load_audio(args.src_wav, model.content_sample_rate)
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
-    if args.streaming:
-        print(args.streaming)
+    if args.mode == 'echo' or args.mode == 'live_stream':
         streaming = StreamingBuffer(model, args.device, ref_audio, args)
         streaming.start()
     else:
-        if(args.test):
-            # 음성파일 읽고 StreamingBuffer 수행
+        if(args.mode == 'file_stream'):
             non_streaming = StreamingBuffer(model, args.device, ref_audio, args)
             non_streaming.start_for_nonstreaming(src_wav)
-        else:
-            pre_audio = synthesize_utt_streaming(model, src_wav, ref_audio) 
+        if(args.mode == 'default'):
+            pre_audio = synthesize_utt_streaming_v2(model, src_wav, ref_audio) 
             torchaudio.save(args.output_path, pre_audio.unsqueeze(0).detach().cpu(), config.audio.sample_rate)
