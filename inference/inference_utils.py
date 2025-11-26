@@ -456,17 +456,24 @@ def synthesize_utt_streaming_testflow(
     
     # 1.1 Content Feature 추출 
     # Note: extract_content_features expects (batch, T) shape
+
+    print("input_tensor.shape : ", input_tensor.shape)
     content_feat = genVC_mdl.content_extractor.extract_content_features(input_tensor)
+
+    print("content_feat.shape : ", content_feat.shape)
     
     t1_feature = time.time()
     timing_log['1_feature_extraction'] = (t1_feature - t1_start) * 1000  # ms
     
     # 1.2 Content Code 추출 (DVAE)
     full_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
+
+    #TODO: print full_codes len 
+    print("full_codes.shape : ", full_codes.shape)
     
     t1_dvae = time.time()
     timing_log['2_dvae_quantization'] = (t1_dvae - t1_feature) * 1000  # ms
-
+    
     # 1.3 Content Code 개수 계산하기 
     '''
         If 컨텍스트가 꽉 찬 상태
@@ -475,9 +482,7 @@ def synthesize_utt_streaming_testflow(
     '''
     
     # 1.4 이번 내용에만 딱 맞는 Content Code 슬라이싱
-    # 3청크 입력 중 맨 뒤(현재)에 해당하는 토큰만 가져옴
-    # 시간축 동기화를 위해 정확히 계산된 개수만큼 뒤에서 자름.
-    target_content_tokens = full_codes[:, -tokens_to_generate:]
+    target_content_tokens = full_codes # 일단은 그냥 다 씁시다. 지금 Future를 안씁니다. 
 
     print("target_content_tokens.shape : ", target_content_tokens.shape)
     
@@ -555,6 +560,8 @@ def synthesize_utt_streaming_testflow(
     # Mel Head의 Positional Embedding 한계 
     max_pos_mel = gpt.mel_pos_embedding.emb.num_embeddings
 
+    # test
+    tokens_to_generate = chunk_size // 1024
     print("[Forward] 생성할 Acoustics Tokens 수 :", tokens_to_generate)
 
     # (Generation Loop) 
@@ -618,21 +625,27 @@ def synthesize_utt_streaming_testflow(
         next_token = torch.argmax(logits, dim=-1) 
         all_tokens.append(next_token.item())
 
-        # 3.5 Setup for Next Prediction 
-        all_latents.append(hidden)
-        curr_token = next_token
-        curr_pos += 1
-
-        # 3.6 Stop Check 필요 
-
+        # Stop Check 
         '''
         모델이 인터리빙을 잘 이해하지 못하고 바로 end_token을 뱉는 상황에 대한 예외 처리 가능성이 필요할 수 있음 
         ''' 
         if next_token.item() == gpt.stop_audio_token:
-            print("End Token reached...")
-            #TODO: 중단된 상태에서 토큰을 얼마나 많이 만들었었는지 출력 
-            print(f"Generated {len(all_latents)}, {len(all_tokens)} tokens before end token. goal: {tokens_to_generate}")
-            break
+            print(f"⚠️ [Early Stop Token Detected] at {len(all_latents)}/{tokens_to_generate} tokens")
+            print(f"   Generated {len(all_latents)} latents, {len(all_tokens)} tokens before stop. Goal: {tokens_to_generate}")
+            
+            # Stop token 무시하고 직전 토큰 재사용
+            next_token = curr_token  # 직전 토큰으로 교체
+            # hidden은 버림 (all_latents에 추가하지 않음)
+            print(f"   ✓ Stop token ignored. Reusing previous token: {curr_token.item()}")
+            all_latents.append(all_latents[-1])
+            
+        else:
+            # 정상 토큰인 경우에만 히든 추가
+            all_latents.append(hidden)
+        
+        # 3.5 Setup for Next Prediction 
+        curr_token = next_token
+        curr_pos += 1
         
     t3_gpt_end = time.time()
     timing_log['4_gpt_generation'] = (t3_gpt_end - t3_gpt_start) * 1000  # ms

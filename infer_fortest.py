@@ -14,13 +14,13 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1600*4 # 이걸 올리면 퀄리티가 올라갈거 
+        self.chunk = 5120*2 # 4 contents, 5 audios.  
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
         self.FUTURE_CHUNK = 0
-        input_rate = 24000 
+        input_rate = 16000
         output_rate = 24000
 
         self.input_queue = queue.Queue()
@@ -132,6 +132,16 @@ class StreamingBuffer:
 
         self.output_stream.start_stream()
         src_wav = src_wav.to(self.device)
+
+        # TODO: src_wav sample/src_preview.wav 로 저장하기 
+        output_path = 'samples/src_preview.wav'
+        # src_wav는 이미 2D [channels, samples] 형태
+        torchaudio.save('samples/src_preview_2.wav', src_wav.cpu(), 16000)
+        torchaudio.save(output_path, src_wav.cpu(), self.model.config.audio.sample_rate)
+
+        log = [] 
+        log.append("src_wav.shape : " + str(src_wav.shape))
+
         for i in range(0, src_wav.shape[1], self.chunk): 
             self.input_queue.put(src_wav[:, i:i + self.chunk])
         try:
@@ -171,12 +181,14 @@ class StreamingBuffer:
 
                 # converted_audio 청크 저장 
                 audio_chunks.append(converted_tensor.cpu())
+                log.append("audio_chunk_size : " + str(converted_tensor.shape))
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
 
             # 모든 청크를 연결하여 최종 오디오 생성
             if audio_chunks:
+                print("log : ", log)
                 final_audio = torch.cat(audio_chunks, dim=0)
                 output_path = 'samples/converted_file_streaming.wav'
                 torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
@@ -211,7 +223,7 @@ if __name__ == '__main__':
     # top_k is one of the important hyperparameters for inference, so you can tune it to get better results
     # for streaming inference, greedy decoding is preferred, you can set top_k to 1
     model.config.top_k = args.top_k
-    src_wav = load_audio(args.src_wav, model.content_sample_rate)
+    src_wav = load_audio(args.src_wav, model.config.content_sample_rate)
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
     '''
