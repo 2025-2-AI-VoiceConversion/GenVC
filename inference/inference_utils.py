@@ -555,6 +555,8 @@ def synthesize_utt_streaming_testflow(
     # Mel Head의 Positional Embedding 한계 
     max_pos_mel = gpt.mel_pos_embedding.emb.num_embeddings
 
+    print("[Forward] 생성할 Acoustics Tokens 수 :", tokens_to_generate)
+
     # (Generation Loop) 
     for _ in range(tokens_to_generate):
 

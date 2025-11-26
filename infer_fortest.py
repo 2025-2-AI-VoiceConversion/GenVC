@@ -14,16 +14,13 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 1600 # 이걸 올리면 퀄리티가 올라갈거
-        if(args.test): self.chunk = 16000
+        self.chunk = 1600*4 # 이걸 올리면 퀄리티가 올라갈거 
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
-        self.FUTURE_CHUNK = 2
-        if(args.test): self.FUTURE_CHUNK = 0
-        input_info = self.p.get_default_input_device_info()
-        input_rate = 24000
+        self.FUTURE_CHUNK = 0
+        input_rate = 24000 
         output_rate = 24000
 
         self.input_queue = queue.Queue()
@@ -39,8 +36,7 @@ class StreamingBuffer:
             except queue.Empty:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
-
-        if(args.test and not args.mic):
+        if(args.mode == 'file_stream'):
             pass
         else:
             self.input_stream = self.p.open(
@@ -81,7 +77,6 @@ class StreamingBuffer:
 
                 # -1.0 ~ 1.0 사이로 클리핑 (Contribution), 15배는 너무 커질 수 있음 
                 input_np = np.clip(input_np, -1.0, 1.0) 
-
                 current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
                 
                 # 버퍼에 있는 데이터 + 현재 데이터
@@ -97,7 +92,7 @@ class StreamingBuffer:
                     self.context_buffer.pop(0)
 
                 # 이거지우면 변환함수 돌아감
-                if(args.test): 
+                if(args.mode == 'echo'):
                     converted_tensor = current_tensor
                 else:
                     with torch.no_grad():
@@ -127,9 +122,17 @@ class StreamingBuffer:
 
     def start_for_nonstreaming(self, src_wav):
         # 파일 읽고 변환
+
+        # --- 상태 변수 ---
+        past_key_values = None 
+        global_pos = 0
+        last_audio_token = None 
+        audio_chunks = []  
+        # ---------------
+
         self.output_stream.start_stream()
         src_wav = src_wav.to(self.device)
-        for i in range(0, src_wav.shape[1], self.chunk):
+        for i in range(0, src_wav.shape[1], self.chunk): 
             self.input_queue.put(src_wav[:, i:i + self.chunk])
         try:
             while True:
@@ -151,16 +154,40 @@ class StreamingBuffer:
                     self.context_buffer.pop(0)
 
                 with torch.no_grad():
-                    converted_tensor = synthesize_utt_streaming_v2(self.model, input_tensor, self.cond_latent)
+                    #TODO: Use streaming testflow. 
+
+                    converted_tensor, past_key_values, last_audio_token, global_pos = synthesize_utt_streaming_testflow(
+                        self.model, 
+                        input_tensor, # [1,1,chunksize * 3]
+                        self.cond_latent,
+                        self.chunk,
+                        past_key_values,
+                        global_pos,
+                        last_audio_token
+                        )
+
                     if(converted_tensor is None):
                         continue
-                
 
+                # converted_audio 청크 저장 
+                audio_chunks.append(converted_tensor.cpu())
+                
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
 
+            # 모든 청크를 연결하여 최종 오디오 생성
+            if audio_chunks:
+                final_audio = torch.cat(audio_chunks, dim=0)
+                output_path = 'samples/converted_file_streaming.wav'
+                torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
+
         except KeyboardInterrupt:
-            # 닫기
+            print("Detect KeyboardInterrupt")
+            if audio_chunks:
+                final_audio = torch.cat(audio_chunks, dim=0)
+                output_path = 'samples/converted_file_streaming.wav'
+                torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
+            
             self.input_stream.stop_stream()
             self.input_stream.close()
             self.output_stream.stop_stream()
@@ -175,12 +202,10 @@ if __name__ == '__main__':
     parser.add_argument('--ref_audio', type=str, default='samples/EF4_ENG_0112_1.wav')
     parser.add_argument('--output_path', type=str, default='samples/converted.wav')
     parser.add_argument('--top_k', type=int, default=15)
-    parser.add_argument('--mic', type=str, default='0')
-    parser.add_argument('--test', type=str, default='0')
-
+    parser.add_argument('--mode', type=str, default='file_stream')
+    
     args = parser.parse_args()
-    args.mic = args.mic == '1'
-    args.test = args.test == '1'
+    args.mode = args.mode.strip()
     model, config = model_init(args.model_path, args.device)
 
     # top_k is one of the important hyperparameters for inference, so you can tune it to get better results
@@ -189,15 +214,22 @@ if __name__ == '__main__':
     src_wav = load_audio(args.src_wav, model.content_sample_rate)
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
-    if args.mic:
-        print(args.streaming)
+    '''
+    [MODE]
+    - echo : echo mode (loopback test)
+    - live_stream : live stream mode (Ours + real time Mic)
+    - file_stream : file stream mode (Ours + offline File)
+    - default : default mode (GenVC)
+
+    ''' 
+    if args.mode == 'echo' or args.mode == 'live_stream':
         streaming = StreamingBuffer(model, args.device, ref_audio, args)
         streaming.start()
     else:
-        if(args.test):
-            # 음성파일 읽고 StreamingBuffer 수행
-            non_streaming = StreamingBuffer(model, args.device, ref_audio, args)
-            non_streaming.start_for_nonstreaming(src_wav)
-        else:
-            pre_audio = synthesize_utt_streaming(model, src_wav, ref_audio) 
+        if(args.mode == 'file_stream'):
+            file_stream = StreamingBuffer(model, args.device, ref_audio, args)
+            file_stream.start_for_nonstreaming(src_wav)
+
+        if(args.mode == 'default'):
+            pre_audio = synthesize_utt_streaming_v2(genVC_mdl=model, src_wav=src_wav, cond_latent=model.get_gpt_cond_latents(ref_audio, model.config.audio.sample_rate)) 
             torchaudio.save(args.output_path, pre_audio.unsqueeze(0).detach().cpu(), config.audio.sample_rate)
