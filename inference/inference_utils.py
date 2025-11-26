@@ -478,6 +478,8 @@ def synthesize_utt_streaming_testflow(
     # 3청크 입력 중 맨 뒤(현재)에 해당하는 토큰만 가져옴
     # 시간축 동기화를 위해 정확히 계산된 개수만큼 뒤에서 자름.
     target_content_tokens = full_codes[:, -tokens_to_generate:]
+
+    print("target_content_tokens.shape : ", target_content_tokens.shape)
     
     # =========================================================================
     # 2. GPT 임베딩 준비 [Cond + Target_Content + Audio Prompt]
@@ -525,7 +527,7 @@ def synthesize_utt_streaming_testflow(
     t2_prefill_end = time.time()
     timing_log['3_kv_prefill'] = (t2_prefill_end - t2_prefill_start) * 1000  # ms
     
-    '''
+    ''' 
     2.3 추가 설명 )
 
     Before KVCache : [스타일 + 옛날 내용 + 옛날 음향]

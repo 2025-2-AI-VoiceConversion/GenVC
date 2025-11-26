@@ -40,7 +40,7 @@ class StreamingBuffer:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
 
-        if(args.test and not args.streaming):
+        if(args.test and not args.mic):
             pass
         else:
             self.input_stream = self.p.open(
@@ -175,11 +175,11 @@ if __name__ == '__main__':
     parser.add_argument('--ref_audio', type=str, default='samples/EF4_ENG_0112_1.wav')
     parser.add_argument('--output_path', type=str, default='samples/converted.wav')
     parser.add_argument('--top_k', type=int, default=15)
-    parser.add_argument('--streaming', type=str, default='0')
+    parser.add_argument('--mic', type=str, default='0')
     parser.add_argument('--test', type=str, default='0')
 
     args = parser.parse_args()
-    args.streaming = args.streaming == '1'
+    args.mic = args.mic == '1'
     args.test = args.test == '1'
     model, config = model_init(args.model_path, args.device)
 
@@ -189,7 +189,7 @@ if __name__ == '__main__':
     src_wav = load_audio(args.src_wav, model.content_sample_rate)
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
-    if args.streaming:
+    if args.mic:
         print(args.streaming)
         streaming = StreamingBuffer(model, args.device, ref_audio, args)
         streaming.start()
