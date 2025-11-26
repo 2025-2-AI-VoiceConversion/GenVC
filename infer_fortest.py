@@ -1,5 +1,5 @@
 from inference.model_init import model_init
-from inference.inference_utils import synthesize_utt_streaming_v2
+from inference.inference_utils import synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2
 from utils import load_audio
 import torch
 import torchaudio
