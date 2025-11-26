@@ -1,5 +1,5 @@
 from inference.model_init import model_init
-from inference.inference_utils import synthesize_utt_streaming, synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2
+from inference.inference_utils import synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2
 from utils import load_audio
 import torch
 import torchaudio
@@ -14,17 +14,26 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 5120*2 # 4 contents, 5 audios.  
+        self.chunk = 16000 # 이걸 올리면 퀄리티가 올라갈거
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
         self.FUTURE_CHUNK = 0
-        input_rate = 16000
-        output_rate = 24000
+        self.past_key_values = None 
+        self.global_pos = 0
+        self.last_audio_token = None
+        self.input_rate = 24000 
+        self.output_rate = 24000
 
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
+        self.writer = None
+        
+        if(args.save_audio):
+            self.writer = torchaudio.io.StreamWriter(args.output_path)
+            self.writer.add_audio_stream(sample_rate=output_rate, num_channels=1)
+
 
         def input_callback(in_data, frame_count, time_info, status):
             self.input_queue.put(in_data) # 들어온 오디오를 큐에 쌓음
@@ -36,13 +45,14 @@ class StreamingBuffer:
             except queue.Empty:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
+
         if(args.mode == 'file_stream'):
             pass
         else:
             self.input_stream = self.p.open(
                 format=pyaudio.paFloat32,
                 channels=1,
-                rate=input_rate,
+                rate=self.input_rate,
                 input=True,
                 frames_per_buffer=self.chunk,
                 stream_callback=input_callback
@@ -51,34 +61,40 @@ class StreamingBuffer:
         self.output_stream = self.p.open(
             format=pyaudio.paFloat32,
             channels=1,
-            rate=output_rate,
+            rate=self.output_rate,
             output=True,
             frames_per_buffer=self.chunk,
             stream_callback=output_callback
         )
 
-    def start(self):
+    def start(self, src_wav):
         print("곧 시작합니다")
-
-        # --- 상태 변수 ---
-        past_key_values = None 
-        global_pos = 0
-        last_audio_token = None 
-        # ---------------
-
-        self.input_stream.start_stream()
+        if(args.mode == 'echo' or args.mode == 'live_stream'):
+            self.input_stream.start_stream()
+        elif(args.mode == 'file_stream'):
+            src_wav = src_wav.to(self.device)
+            for i in range(0, src_wav.shape[1], self.chunk):
+                self.input_queue.put(src_wav[:, i:i + self.chunk])
+        
         self.output_stream.start_stream()
+        
+        writer_stream = None
+        if self.writer is not None:
+            writer_stream = self.writer.open()
+        
         try:
             while True:
-                in_data = self.input_queue.get()
-                
-                input_np = np.frombuffer(in_data, dtype=np.float32).copy()
-                input_np *= 15 # 소리가 너무 작아서 올렸는데 귀터짐 주의
-
-                # -1.0 ~ 1.0 사이로 클리핑 (Contribution), 15배는 너무 커질 수 있음 
-                input_np = np.clip(input_np, -1.0, 1.0) 
-                current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
-                
+                if(args.mode == 'echo' or args.mode == 'live_stream'):
+                    if(self.input_queue.empty()):
+                        time.sleep(0.1)
+                        continue
+                    in_data = self.input_queue.get()
+                    input_np = np.frombuffer(in_data, dtype=np.float32).copy()
+                    current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
+                elif(args.mode == 'file_stream'):
+                    if(self.input_queue.empty()):
+                        break
+                    current_tensor = self.input_queue.get()
                 # 버퍼에 있는 데이터 + 현재 데이터
                 padding_size = (self.FUTURE_CHUNK - len(self.context_buffer)) * self.chunk
                 if self.context_buffer:
@@ -94,98 +110,27 @@ class StreamingBuffer:
                 # 이거지우면 변환함수 돌아감
                 if(args.mode == 'echo'):
                     converted_tensor = current_tensor
-                else:
+                elif(args.mode == 'live_stream' or args.mode == 'file_stream'):
                     with torch.no_grad():
-                        converted_tensor, past_key_values, last_audio_token, global_pos = synthesize_utt_streaming_testflow(
+                        converted_tensor, self.past_key_values, self.last_audio_token, self.global_pos = synthesize_utt_streaming_testflow(
                         self.model, 
-                        input_tensor, # [1,1,chunksize * 3]
+                        input_tensor,
                         self.cond_latent,
                         self.chunk,
-                        past_key_values,
-                        global_pos,
-                        last_audio_token
+                        self.past_key_values,
+                        self.global_pos,
+                        self.last_audio_token
                         )
 
                         if(converted_tensor is None):
                             continue
+
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
 
-        except KeyboardInterrupt:
-            # 닫기
-            self.input_stream.stop_stream()
-            self.input_stream.close()
-            self.output_stream.stop_stream()
-            self.output_stream.close()
-            self.p.terminate()
-
-    def start_for_nonstreaming(self, src_wav):
-        # 파일 읽고 변환
-
-        # --- 상태 변수 ---
-        past_key_values = None 
-        global_pos = 0
-        last_audio_token = None 
-        audio_chunks = []  
-        # ---------------
-
-        self.output_stream.start_stream()
-        src_wav = src_wav.to(self.device)
-
-        # TODO: src_wav sample/src_preview.wav 로 저장하기 
-        output_path = 'samples/src_preview.wav'
-        # src_wav는 이미 2D [channels, samples] 형태
-        torchaudio.save('samples/src_preview_2.wav', src_wav.cpu(), 16000)
-        torchaudio.save(output_path, src_wav.cpu(), self.model.config.audio.sample_rate)
-
-        log = [] 
-        log.append("src_wav.shape : " + str(src_wav.shape))
-
-        for i in range(0, src_wav.shape[1], self.chunk): 
-            self.input_queue.put(src_wav[:, i:i + self.chunk])
-        try:
-            while True:
-                current_tensor = self.input_queue.get()
-                if current_tensor.size(1) == 0 or self.input_queue.empty():
-                    time.sleep(5)
-                    break
-
-                # 버퍼에 있는 데이터 + 현재 데이터
-                padding_size = (self.FUTURE_CHUNK - len(self.context_buffer)) * self.chunk
-                if self.context_buffer:
-                    input_tensor = torch.cat(self.context_buffer + [current_tensor], dim=1)
-                else:
-                    input_tensor = current_tensor
-                input_tensor = torch.nn.functional.pad(input_tensor, (padding_size, 0), "constant", 0)
-                
-                self.context_buffer.append(current_tensor)
-                if len(self.context_buffer) > self.FUTURE_CHUNK:
-                    self.context_buffer.pop(0)
-
-                with torch.no_grad():
-                    #TODO: Use streaming testflow. 
-
-                    converted_tensor, past_key_values, last_audio_token, global_pos = synthesize_utt_streaming_testflow(
-                        self.model, 
-                        input_tensor, # [1,1,chunksize * 3]
-                        self.cond_latent,
-                        self.chunk,
-                        past_key_values,
-                        global_pos,
-                        last_audio_token
-                        )
-
-                    if(converted_tensor is None):
-                        continue
-
-                # converted_audio 청크 저장 
-                audio_chunks.append(converted_tensor.cpu())
-                log.append("audio_chunk_size : " + str(converted_tensor.shape))
-                
-                output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
-                self.output_queue.put(output_np.tobytes())
-
+                if writer_stream is not None:
+                    writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
             # 모든 청크를 연결하여 최종 오디오 생성
             if audio_chunks:
                 print("log : ", log)
@@ -194,17 +139,18 @@ class StreamingBuffer:
                 torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
 
         except KeyboardInterrupt:
-            print("Detect KeyboardInterrupt")
-            if audio_chunks:
-                final_audio = torch.cat(audio_chunks, dim=0)
-                output_path = 'samples/converted_file_streaming.wav'
-                torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
-            
-            self.input_stream.stop_stream()
-            self.input_stream.close()
+            print("종료")
+        finally:
+            # 닫기
+            if(args.mode == 'echo' or args.mode == 'live_stream'):
+                self.input_stream.stop_stream()
+                self.input_stream.close()
             self.output_stream.stop_stream()
             self.output_stream.close()
             self.p.terminate()
+            
+            if writer_stream is not None:
+                writer_stream.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -215,6 +161,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, default='samples/converted.wav')
     parser.add_argument('--top_k', type=int, default=15)
     parser.add_argument('--mode', type=str, default='file_stream')
+    parser.add_argument('--save_audio', type=int, default=1)
+    # mode = default, file_stream, live_stream, echo
     
     args = parser.parse_args()
     args.mode = args.mode.strip()
@@ -226,22 +174,9 @@ if __name__ == '__main__':
     src_wav = load_audio(args.src_wav, model.config.content_sample_rate)
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
-    '''
-    [MODE]
-    - echo : echo mode (loopback test)
-    - live_stream : live stream mode (Ours + real time Mic)
-    - file_stream : file stream mode (Ours + offline File)
-    - default : default mode (GenVC)
-
-    ''' 
-    if args.mode == 'echo' or args.mode == 'live_stream':
+    if args.mode == 'echo' or args.mode == 'live_stream' or args.mode == 'file_stream':
         streaming = StreamingBuffer(model, args.device, ref_audio, args)
-        streaming.start()
-    else:
-        if(args.mode == 'file_stream'):
-            file_stream = StreamingBuffer(model, args.device, ref_audio, args)
-            file_stream.start_for_nonstreaming(src_wav)
-
-        if(args.mode == 'default'):
-            pre_audio = synthesize_utt_streaming_v2(genVC_mdl=model, src_wav=src_wav, cond_latent=model.get_gpt_cond_latents(ref_audio, model.config.audio.sample_rate)) 
-            torchaudio.save(args.output_path, pre_audio.unsqueeze(0).detach().cpu(), config.audio.sample_rate)
+        streaming.start(src_wav)
+    elif(args.mode == 'default'):
+        pre_audio = synthesize_utt_streaming_v2(model, src_wav, ref_audio) 
+        torchaudio.save(args.output_path, pre_audio.unsqueeze(0).detach().cpu(), config.audio.sample_rate)
