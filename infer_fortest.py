@@ -23,18 +23,16 @@ class StreamingBuffer:
         self.past_key_values = None 
         self.global_pos = 0
         self.last_audio_token = None
-        self.input_rate = 16000
+        self.input_rate = 16000 # 441000 96000
         self.output_rate = 24000
-        self.audio_chunks = []
 
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
-        #self.writer = None
+        self.writer = None
         
         if(args.save_audio):
-            pass 
-            #self.writer = torchaudio.io.StreamWriter(args.output_path)
-            #self.writer.add_audio_stream(sample_rate=output_rate, num_channels=1)
+            self.writer = torchaudio.io.StreamWriter(args.output_path)
+            self.writer.add_audio_stream(sample_rate=self.output_rate, num_channels=1)
 
 
         def input_callback(in_data, frame_count, time_info, status):
@@ -86,9 +84,9 @@ class StreamingBuffer:
         
         self.output_stream.start_stream()
         
-        #writer_stream = None
-        #if self.writer is not None:
-        #    writer_stream = self.writer.open()
+        writer_stream = None
+        if self.writer is not None:
+            writer_stream = self.writer.open()
         
         try:
             while True:
@@ -135,16 +133,13 @@ class StreamingBuffer:
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
-                if(args.save_audio):
-                    self.audio_chunks.append(converted_tensor)
 
-                #if writer_stream is not None:
-                #    writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
+                if writer_stream is not None:
+                    writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
 
             if self.audio_chunks:
                 final_audio = torch.cat(self.audio_chunks, dim=0)
-                output_path = 'samples/converted_file_streaming.wav'
-                torchaudio.save(output_path, final_audio.unsqueeze(0), self.model.config.audio.sample_rate)
+                #output_path = 'samples/converted_file_streaming.wav'
 
         except KeyboardInterrupt:
             print("종료")
@@ -157,8 +152,8 @@ class StreamingBuffer:
             self.output_stream.close()
             self.p.terminate()
             
-            #if writer_stream is not None:
-            #    writer_stream.close()
+            if writer_stream is not None:
+                writer_stream.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
