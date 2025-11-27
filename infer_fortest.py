@@ -137,10 +137,6 @@ class StreamingBuffer:
                 if writer_stream is not None:
                     writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
 
-            if self.audio_chunks:
-                final_audio = torch.cat(self.audio_chunks, dim=0)
-                #output_path = 'samples/converted_file_streaming.wav'
-
         except KeyboardInterrupt:
             print("종료")
         finally:
