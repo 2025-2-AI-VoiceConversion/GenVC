@@ -18,4 +18,4 @@ samples/sample.wav
 analysis/
 infer_test*
 infer_stream_*
-ref.wav
+ref*.wav

@@ -14,7 +14,7 @@ class StreamingBuffer:
         self.model = model
         self.device = device
         self.p = pyaudio.PyAudio()
-        self.chunk = 16000 # 이걸 올리면 퀄리티가 올라갈거
+        self.chunk = 5120*2 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
@@ -23,7 +23,7 @@ class StreamingBuffer:
         self.past_key_values = None 
         self.global_pos = 0
         self.last_audio_token = None
-        self.input_rate = 24000 
+        self.input_rate = 16000 # 441000 96000
         self.output_rate = 24000
 
         self.input_queue = queue.Queue()
@@ -32,7 +32,7 @@ class StreamingBuffer:
         
         if(args.save_audio):
             self.writer = torchaudio.io.StreamWriter(args.output_path)
-            self.writer.add_audio_stream(sample_rate=output_rate, num_channels=1)
+            self.writer.add_audio_stream(sample_rate=self.output_rate, num_channels=1)
 
 
         def input_callback(in_data, frame_count, time_info, status):
@@ -74,7 +74,13 @@ class StreamingBuffer:
         elif(args.mode == 'file_stream'):
             src_wav = src_wav.to(self.device)
             for i in range(0, src_wav.shape[1], self.chunk):
-                self.input_queue.put(src_wav[:, i:i + self.chunk])
+
+                chunk = src_wav[:, i:i + self.chunk]
+                print("chunk.shape : ", chunk.shape)
+                if chunk.shape[1] < self.chunk:
+                    chunk = torch.nn.functional.pad(chunk, (0, self.chunk - chunk.shape[1]))
+                    print("chunk.shape (modified) : ", chunk.shape)
+                self.input_queue.put(chunk)
         
         self.output_stream.start_stream()
         
@@ -124,7 +130,6 @@ class StreamingBuffer:
 
                         if(converted_tensor is None):
                             continue
-
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
                 self.output_queue.put(output_np.tobytes())
@@ -165,7 +170,7 @@ if __name__ == '__main__':
     # top_k is one of the important hyperparameters for inference, so you can tune it to get better results
     # for streaming inference, greedy decoding is preferred, you can set top_k to 1
     model.config.top_k = args.top_k
-    src_wav = load_audio(args.src_wav, model.content_sample_rate)
+    src_wav = load_audio(args.src_wav, model.content_sample_rate) 
     ref_audio = load_audio(args.ref_audio, model.config.audio.sample_rate)
 
     if args.mode == 'echo' or args.mode == 'live_stream' or args.mode == 'file_stream':
