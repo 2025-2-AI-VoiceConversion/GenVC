@@ -8,6 +8,16 @@ import pyaudio
 import time
 import numpy as np
 import queue
+from dataclasses import dataclass
+
+@dataclass 
+class StreamingState:
+    past_key_values: torch.Tensor = None 
+    last_audio_token: torch.Tensor = None
+    global_pos: int = 0
+    wav_gen_prev: torch.Tensor = None
+    wav_overlap: torch.Tensor = None
+    prompt_kv_cache: torch.Tensor = None
 
 class StreamingBuffer:
     def __init__(self, model, device, ref_audio, args):
@@ -20,9 +30,10 @@ class StreamingBuffer:
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
         self.FUTURE_CHUNK = 0
-        self.past_key_values = None 
-        self.global_pos = 0
-        self.last_audio_token = None
+
+        # 스트리밍 중 상태변수 관리용 
+        self.state = StreamingState()
+
         self.input_rate = 16000 # 441000 96000
         self.output_rate = 24000
 
@@ -118,14 +129,12 @@ class StreamingBuffer:
                     converted_tensor = current_tensor
                 elif(args.mode == 'live_stream' or args.mode == 'file_stream'):
                     with torch.no_grad():
-                        converted_tensor, self.past_key_values, self.last_audio_token, self.global_pos = synthesize_utt_streaming_testflow(
+                        converted_tensor  = synthesize_utt_streaming_testflow(
                         self.model, 
                         input_tensor,
                         self.cond_latent,
                         self.chunk,
-                        self.past_key_values,
-                        self.global_pos,
-                        self.last_audio_token
+                        self.state 
                         )
 
                         if(converted_tensor is None):

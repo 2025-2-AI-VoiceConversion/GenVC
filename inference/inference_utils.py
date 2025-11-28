@@ -1,5 +1,7 @@
 import torch
 import time
+from typing import Optional
+from experiment.stream_config import StreamConfig
 
 @torch.inference_mode()
 def handle_chunks(wav_gen, wav_gen_prev, wav_overlap, overlap_len=1024):
@@ -19,7 +21,7 @@ def handle_chunks(wav_gen, wav_gen_prev, wav_overlap, overlap_len=1024):
     wav_overlap = wav_gen[-overlap_len:]
     wav_gen_prev = wav_gen
     return wav_chunk, wav_gen_prev, wav_overlap
-
+    
 @torch.inference_mode()
 def synthesize_utt(
     genVC_mdl, 
@@ -410,9 +412,8 @@ def synthesize_utt_streaming_testflow(
     input_tensor,
     cond_latent, 
     chunk_size, 
-    past_key_values=None, 
-    global_pos = 0,
-    last_audio_token=None,
+    state, 
+    stream_config: Optional[StreamConfig] = None,
     ):
     """
     Stateful Streaming Inference Function
@@ -429,9 +430,40 @@ def synthesize_utt_streaming_testflow(
     Returns:
         wav_chunk (audio tensor), past_key_values, last_audio_token, global_pos
     """ 
-    
+
     # =========================================================================
-    # 0. Constants & Timing Setup
+    # 0-1. Hyperparameters Setup 
+    # =========================================================================
+
+    # Default values 
+    past_key_values = state.past_key_values
+    last_audio_token = state.last_audio_token
+    global_pos = state.global_pos
+    wav_gen_prev = state.wav_gen_prev
+    wav_overlap = state.wav_overlap
+    prompt_kv_cache = state.prompt_kv_cache
+
+    # HyperParameter Setup
+    if stream_config:
+        chunk_size = stream_config.chunk_size
+        use_kv_cache = stream_config.use_kv_cache
+        kv_cache_window = stream_config.kv_cache_window # OK
+        cross_fade_duration = stream_config.cross_fade_duration
+        top_k = stream_config.top_k
+        num_content_token = stream_config.num_content_token
+        past_chunk_size = stream_config.past_chunk_size
+
+    else:
+        chunk_size = chunk_size
+        use_kv_cache = False
+        kv_cache_window = 100
+        cross_fade_duration = 1024 
+        top_k: int = 1 # Greedy Sampling 
+        past_chunk_size: int = 0 # 0이면 현재 청크만 사용함 
+        num_content_token = int(chunk_size / 1280)
+
+    # =========================================================================
+    # 0-2. Constants & Timing Setup
     # =========================================================================
     import time # 딜레이 로깅용 
     
@@ -477,13 +509,6 @@ def synthesize_utt_streaming_testflow(
     t1_dvae = time.time()
     timing_log['2_dvae_quantization'] = (t1_dvae - t1_feature) * 1000  # ms
     
-    # 1.3 Content Code 개수 계산하기 
-    '''
-        If 컨텍스트가 꽉 찬 상태
-        Else 아직 꽉 차지는 않은 상태 
-        분기 나눠서 정확히 처리할 수 있어야함. 지금 구현 바보구현 
-    '''
-    
     # 1.4 이번 내용에만 딱 맞는 Content Code 슬라이싱
     target_content_tokens = full_codes # 일단은 그냥 다 씁시다. 지금 Future를 안씁니다. 
 
@@ -496,48 +521,52 @@ def synthesize_utt_streaming_testflow(
     목표 : 기존 KV Cache 뒤에 새로운 Text 를 붙인다. 
     상황 : [Prompt ... Content A Audio A] + [Content B] 를 붙임 
     '''
-
     # 2-1-1. Content 임베딩
     txt_emb = gpt.text_embedding(target_content_tokens) # [B, T, Dim]
 
     # 2-1-2. Content Positional Embedding
     seq_len = target_content_tokens.shape[1]
-    pos_ids_txt = torch.arange(global_pos, global_pos + seq_len, device=device) # 얘는 뭐임?
+    pos_ids_txt = torch.arange(global_pos, global_pos + seq_len, device=device) 
     
     # Positional Limit Clamping (학습된 길이를 초과하는 것을 방지) 
-    max_pos_txt = gpt.text_pos_embedding.emb.num_embeddings # 얘는 뭐임?
+    max_pos_txt = gpt.text_pos_embedding.emb.num_embeddings 
 
     if((global_pos + seq_len) >= max_pos_txt):
-                print(f"[WARNING] Text Positional Limit Reached! Current: {global_pos + seq_len}, Max: {max_pos_txt}")
+        print(f"[WARNING] Text Positional Limit Reached! Current: {global_pos + seq_len}, Max: {max_pos_txt}")
 
-    pos_ids_txt = torch.clamp(pos_ids_txt, max=max_pos_txt-1) # 얘는 뭐임? 
+    pos_ids_txt = torch.clamp(pos_ids_txt, max=max_pos_txt-1) 
 
     txt_pos = gpt.text_pos_embedding.emb(pos_ids_txt).unsqueeze(0)
     emb_content = txt_emb + txt_pos
 
     # 2-2 Input Embedding 구성 
-
+    
     # 2-2-1. 최초 실행 
     if past_key_values is None:
-        inputs_embeds = torch.cat([cond_latent, emb_content], dim=1)
+
+        # Prompt Cache 저장 
+        out = gpt.gpt(inputs_embeds=cond_latent, use_cache=True)
+        past_key_values = out.past_key_values
+        global_pos = cond_latent.shape[1]
+        prompt_kv_cache = past_key_values
+
+        # Inputs Embedding 구성 
+        inputs_embeds = emb_content 
         # Start Token 초기화
         last_audio_token = torch.tensor([[gpt.start_audio_token]], device=device)
     else:
         # [스트리밍 중]: 이전 KV Cache 뒤에 이번 Content만 붙임 
         inputs_embeds = emb_content
-
+        
     # 2-3. Forward (Text Prefill)
     t2_prefill_start = time.time()
-    
     out = gpt.gpt(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
     past_key_values = out.past_key_values
     
     t2_prefill_end = time.time()
     timing_log['3_kv_prefill'] = (t2_prefill_end - t2_prefill_start) * 1000  # ms
-    
     ''' 
     2.3 추가 설명 )
-
     Before KVCache : [스타일 + 옛날 내용 + 옛날 음향]
         [2.3 포워드 진행 후]
     After KVCache : [스타일 + 옛날 내용 + 옛날 음향 + 이번 텍스트 내용]
@@ -545,11 +574,6 @@ def synthesize_utt_streaming_testflow(
     
     # 2-4. 글로벌 커서 업데이트 (추가된 만큼) 
     global_pos += inputs_embeds.shape[1] 
-
-    '''
-    3. GPT_Forward [Audio Generation]
-    목표: tokens_to_generate 만큼 오디오 토큰을 생성하면 된다. 
-    '''
 
     # =========================================================================
     # 3. GPT_Forward [Audio Generation]
@@ -622,8 +646,24 @@ def synthesize_utt_streaming_testflow(
         # stop token 방지 
         logits[:, :, gpt.stop_audio_token] = -float('inf')
 
-        # 3.4. Greedy Sampling 
-        next_token = torch.argmax(logits, dim=-1) 
+        # 3.4. Top-K Sampling
+        if top_k > 1:
+            # Top-K 샘플링
+            # 1) Top-K 값들과 인덱스 가져오기
+            top_k_logits, top_k_indices = torch.topk(logits, k=top_k, dim=-1)  # [1, 1, k]
+            
+            # 2) Top-K 로짓에 대해 Softmax → 확률 분포
+            top_k_probs = torch.nn.functional.softmax(top_k_logits, dim=-1)  # [1, 1, k]
+            
+            # 3) 확률 분포에서 샘플링
+            sampled_index = torch.multinomial(top_k_probs.squeeze(), num_samples=1)  # [1]
+            
+            # 4) 실제 토큰 ID 가져오기
+            next_token = top_k_indices[0, 0, sampled_index].unsqueeze(0)  # [1, 1]
+        else:
+            # top_k == 1: Greedy Sampling (기존 방식)
+            next_token = torch.argmax(logits, dim=-1)
+        
         all_tokens.append(next_token.item())
 
         # Stop Check 
@@ -657,6 +697,9 @@ def synthesize_utt_streaming_testflow(
     # 4. Sliding Window KVCache - 구현 해야함. 
     # =========================================================================
     # 캐시가 너무 커지면 OOM 방지를 위해 앞을 자름
+
+    if kv_cache_window:
+        pass 
 
     '''
     NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
@@ -701,19 +744,7 @@ def synthesize_utt_streaming_testflow(
 
     # 5.1 Acoustic Latent 제작  
     acoustic_latents = torch.cat(all_latents, dim=1) # [B, tokens_to_generate, Dim]
-    
-    '''
-    gpt_code_stride_len = 1024 로 음성 토큰 1개당 오디오 1024샘플이다.
-    hop_length = 256 으로 하이파이갠 홉 사이즈는 256.
-    즉 4배의 시간 해상도 차이가 존재한다. 
-    1GPT token = 4 Mel frame 이다. 
 
-    원본 GPT 토큰:    [A]             [B]                 [C]          [D]
-                       ↓                ↓                ↓           ↓
-    보간 후:        [A] [a1][a2][a3][B][b1][b2][b3][C][c1][c2][c3][D]...
-                      └─────┘          └─────┘        └─────┘
-                      4 frames         4 frames      4 frames
-    '''
     # 5.2 선형 보간을 활용해서 Mel Input (to Vocoder)
     mel_input = torch.nn.functional.interpolate(
         acoustic_latents.transpose(1, 2),
@@ -722,8 +753,19 @@ def synthesize_utt_streaming_testflow(
     ).squeeze(1)
     
     # 5.3 Hifi-GAN 음성 합성 
-    wav_chunk = genVC_mdl.hifigan.forward(mel_input).squeeze()
-    
+    wav_gen = genVC_mdl.hifigan.forward(mel_input).squeeze()
+
+    # 5.4 Cross-Fading 적용 (stream_config 사용)
+    if cross_fade_duration > 0:
+        wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+            wav_gen,                                      # 현재 생성된 오디오
+            wav_gen_prev,                                 # 이전 청크 (처음엔 None)
+            wav_overlap,                                  # 이전 overlap (처음엔 None)
+            overlap_len=cross_fade_duration # Config에서 가져옴
+        )
+    else:
+        wav_chunk = wav_gen
+
     t4_vocoder_end = time.time()
     timing_log['5_vocoding'] = (t4_vocoder_end - t4_vocoder_start) * 1000  # ms
     
@@ -755,13 +797,17 @@ def synthesize_utt_streaming_testflow(
     
     sys.stdout.write(log_output)
     sys.stdout.flush()
-    
-    
-    # 5.5 Cross-Fading Overlap 구현
-    '''
-    wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
-        wav_chunk, wav_gen_prev, wav_overlap, overlap_len=1024
-    )
-    '''             
-    return wav_chunk, past_key_values, last_audio_token, global_pos 
 
+    if (not use_kv_cache):
+        past_key_values = None 
+        global_pos = 0
+
+    # State Update 
+    state.past_key_values = past_key_values
+    state.last_audio_token = last_audio_token
+    state.global_pos = global_pos
+    state.wav_gen_prev = wav_gen_prev
+    state.wav_overlap = wav_overlap
+    state.prompt_kv_cache = prompt_kv_cache
+
+    return wav_chunk
