@@ -56,3 +56,16 @@ python infer_stream.py --model_path pre_trained/GenVC_small.pth --ref_audio samp
 - 하울링 문제 해결 
 - 버퍼 처리 구현 (진행중)
 - 최대 N초까지 과거문맥 어텐션 가능하게 해야함 (지금 계속 다른사람이 말하는 것과 동급임) 
+
+
+# Citations
+```
+@inproceedings{baba2024utmosv2,
+  title     = {The T05 System for The {V}oice{MOS} {C}hallenge 2024: Transfer Learning from Deep Image Classifier to Naturalness {MOS} Prediction of High-Quality Synthetic Speech},
+  author    = {Baba, Kaito and Nakata, Wataru and Saito, Yuki and Saruwatari, Hiroshi},
+  booktitle = {IEEE Spoken Language Technology Workshop (SLT)},
+  year      = {2024},
+}
+```
+
+

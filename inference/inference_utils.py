@@ -1,5 +1,9 @@
 import torch
 import time
+import torchaudio
+import os
+from typing import Optional
+from experiment.stream_config import StreamConfig
 
 @torch.inference_mode()
 def handle_chunks(wav_gen, wav_gen_prev, wav_overlap, overlap_len=1024):
@@ -19,7 +23,7 @@ def handle_chunks(wav_gen, wav_gen_prev, wav_overlap, overlap_len=1024):
     wav_overlap = wav_gen[-overlap_len:]
     wav_gen_prev = wav_gen
     return wav_chunk, wav_gen_prev, wav_overlap
-
+    
 @torch.inference_mode()
 def synthesize_utt(
     genVC_mdl, 
@@ -298,121 +302,14 @@ def synthesize_utt_streaming_v2(
     print(f"Real-time factor: {real_time_factor:.3f}")
     return synthesized_audio
 
-@torch.inference_mode() # Now use 
-def synthesize_utt_streaming_mic(
-    genVC_mdl, 
-    content_token_sequence, # 최대 6초 분량의 context token sequence 
-    cond_latent, # 프롬프트 임베딩 : 외부에서 한번만 미리 계산 (전달만 받음)
-    stream_chunk_size=1,
-    num_token=25, # 한 청크가 몇개의 토큰을 담당하는지 설정 
-    wav_gen_prev=None, 
-    wav_overlap=None,
-    ):
-
-    pred_audios = [] 
-
-    '''
-    [동료 개발자 구현 영역]
-    입력받은 src_content(전체 토큰 시퀀스)를 기반으로,
-    가장 최근 청크(1초)에 해당하는 음성만을 생성하여 리턴해야 합니다.
-    
-    - Generator 상태 관리 (Caching)
-    - Look-ahead / Look-behind 적용, Output Slicing [단 이부분은 보코더 조사 후 pysunn 구현 예정]
-    등의 로직이 이곳에 구현됩니다.
-
-    # 현재 사용하지 않음 
-    min_chunk_duration = int(0.32 * genVC_mdl.content_sample_rate) # current not use
-    ''' 
-    
-    # 지금 상태는 현재 1초랑 과거 5초의 토큰을 사용하고 있습니다. 
-
-    begin_time = time.time()
-    is_begin = True
-    
-    t_gpt_start = time.time()
-    # 총 chunk_size 개 만큼 반복합니다. 만약 chunk_size = 2라면 두개의 청크에 대해서 처리합니다. 
-    for i in range(0, stream_chunk_size): 
-        
-        # 임베딩 제작 : [화자 프롬프트, 내용 문맥, START_AUDIO] 
-        # 슬라이딩 윈도우 어텐션 구현 없이, 이전에 만들었던 모든 임베딩을 전부 저장합니다. 
-        gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_token_sequence) 
-
-        gpt_generator = genVC_mdl.gpt.get_generator( 
-            fake_inputs=gpt_inputs,
-            top_p=genVC_mdl.config.top_p,
-            top_k=genVC_mdl.config.top_k,
-            temperature=genVC_mdl.config.temperature,
-            length_penalty=genVC_mdl.config.length_penalty,
-            repetition_penalty=genVC_mdl.config.repetition_penalty,
-            do_sample=True, # 이거 False로 하면 샘플 스트림 추론 안되더라 
-            num_beams=1,
-            num_return_sequences=1,
-            output_attentions=False,
-            output_hidden_states=True,
-        )
-        
-        # 2. Generate Tokens
-        all_latents = []
-        last_tokens = []
-        is_end = False
-
-        t_gpt_start = time.time()
-        while not is_end:
-            try:
-                x, latent = next(gpt_generator)
-                last_tokens += [x]
-                all_latents += [latent]
-            except StopIteration:
-                is_end = True
-            
-            # 8개의 음성 토큰을 GPT가 만들어 내면, 보코더로 음성 조각을 만들어 리턴한다 
-            if is_end or (num_token > 0 and len(last_tokens) >= num_token):
-                t_gpt_end = time.time()
-                
-                acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
-                mel_input = torch.nn.functional.interpolate(
-                    acoustic_latents.transpose(1, 2),
-                    scale_factor=[genVC_mdl.hifigan_scale_factor],
-                    mode="linear",
-                ).squeeze(1)
-                audio_pred = genVC_mdl.hifigan.forward(mel_input)
-            
-                t_vocoder_end = time.time()
-                print(f"   [Detail] GPT: {t_gpt_end - t_gpt_start:.3f}s | Vocoder: {t_vocoder_end - t_gpt_end:.3f}s")
-
-                # 크로스 페이딩 안함 
-                wav_chunk = audio_pred.squeeze()
-                # Cross-Fading 적용 (일단은 나중에 생각) (지금은 청크 띡띡거림 있음.)
-                #wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
-                #   audio_pred.squeeze(), wav_gen_prev, wav_overlap, overlap_len=1024
-                #)
-                
-                pred_audios.append(wav_chunk)
-                
-                # Speak
-                last_tokens = []
-                all_latents = []
-                
-                if is_begin:
-                    is_begin = False
-                    latency = time.time() - begin_time
-                    print(f"Latency: {latency:.3f}s")
-                    
-                # 한 청크만 만들고 탈출 (스트리밍 루프 제어용)
-                break
-                    
-    # 일단 지금 구현은 6초만큼 생성하고 바로 넘겨주는 쓰레기 구현임.. 
-    return pred_audios
-
 @torch.inference_mode() 
 def synthesize_utt_streaming_testflow(
     genVC_mdl, 
     input_tensor,
     cond_latent, 
     chunk_size, 
-    past_key_values=None, 
-    global_pos = 0,
-    last_audio_token=None,
+    state, 
+    stream_config: Optional[StreamConfig] = None,
     ):
     """
     Stateful Streaming Inference Function
@@ -429,9 +326,42 @@ def synthesize_utt_streaming_testflow(
     Returns:
         wav_chunk (audio tensor), past_key_values, last_audio_token, global_pos
     """ 
-    
+
     # =========================================================================
-    # 0. Constants & Timing Setup
+    # 0-1. Hyperparameters Setup 
+    # =========================================================================
+
+    # Default values 
+    past_key_values = state.past_key_values
+    last_audio_token = state.last_audio_token
+    global_pos = state.global_pos
+    wav_gen_prev = state.wav_gen_prev
+    wav_overlap = state.wav_overlap
+    prompt_kv_cache = state.prompt_kv_cache
+
+    # HyperParameter Setup
+    if stream_config:
+        chunk_size = stream_config.chunk_size
+        dvae_context = stream_config.dvae_context
+        use_kv_cache = stream_config.use_kv_cache
+        kv_cache_window = stream_config.kv_cache_window # OK
+        cross_fade_duration = stream_config.cross_fade_duration
+        top_k = stream_config.top_k
+        num_content_token = stream_config.num_content_token
+        past_chunk_size = stream_config.past_chunk_size
+
+    else:
+        chunk_size = chunk_size
+        dvae_context = 0
+        use_kv_cache = False 
+        kv_cache_window = 100
+        cross_fade_duration = 1024 
+        top_k: int = 1 # Greedy Sampling 
+        past_chunk_size: int = 0 # 0이면 현재 청크만 사용함 
+        num_content_token = int(chunk_size / 1280)
+
+    # =========================================================================
+    # 0-2. Constants & Timing Setup
     # =========================================================================
     import time # 딜레이 로깅용 
     
@@ -460,8 +390,22 @@ def synthesize_utt_streaming_testflow(
     # 1.1 Content Feature 추출 
     # Note: extract_content_features expects (batch, T) shape
 
+    # [DVAE Context] 이전 청크의 마지막 320 샘플을 앞에 붙임
+    DVAE_CONTEXT_LEN = dvae_context
+    
+    if state.prev_audio_tail is not None:
+        # [1, 320] + [1, T] -> [1, 320+T]
+        extended_input = torch.cat([state.prev_audio_tail, input_tensor], dim=-1)
+        has_context = True
+    else:
+        # 첫 청크는 그냥 0으로 패딩하거나 그대로 사용 (여기서는 그대로 사용)
+        extended_input = input_tensor
+        has_context = False
+
     print("input_tensor.shape : ", input_tensor.shape)
-    content_feat = genVC_mdl.content_extractor.extract_content_features(input_tensor)
+    print("extended_input.shape : ", extended_input.shape)
+    
+    content_feat = genVC_mdl.content_extractor.extract_content_features(extended_input)
 
     print("content_feat.shape : ", content_feat.shape)
     
@@ -471,22 +415,28 @@ def synthesize_utt_streaming_testflow(
     # 1.2 Content Code 추출 (DVAE)
     full_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
 
+    # [DVAE Context] 앞에 붙인 Context만큼 결과에서 잘라냄
+    if has_context:
+        # 320 샘플 = 1 토큰 (가정)
+        # Context 1개 버림
+        full_codes = full_codes[:, 1:] 
+        
+    # 다음 턴을 위해 현재 청크의 마지막 320 샘플 저장
+    state.prev_audio_tail = input_tensor[:, -DVAE_CONTEXT_LEN:]
+
     #TODO: print full_codes len 
     print("full_codes.shape : ", full_codes.shape)
     
     t1_dvae = time.time()
     timing_log['2_dvae_quantization'] = (t1_dvae - t1_feature) * 1000  # ms
     
-    # 1.3 Content Code 개수 계산하기 
-    '''
-        If 컨텍스트가 꽉 찬 상태
-        Else 아직 꽉 차지는 않은 상태 
-        분기 나눠서 정확히 처리할 수 있어야함. 지금 구현 바보구현 
-    '''
-    
     # 1.4 이번 내용에만 딱 맞는 Content Code 슬라이싱
     target_content_tokens = full_codes # 일단은 그냥 다 씁시다. 지금 Future를 안씁니다. 
 
+    import torch.nn.functional as F
+    target_content_tokens = F.pad(target_content_tokens, (0, 1), value=gpt.stop_text_token)
+    target_content_tokens = F.pad(target_content_tokens, (1, 0), value=gpt.start_text_token)
+    
     print("target_content_tokens.shape : ", target_content_tokens.shape)
     
     # =========================================================================
@@ -496,48 +446,52 @@ def synthesize_utt_streaming_testflow(
     목표 : 기존 KV Cache 뒤에 새로운 Text 를 붙인다. 
     상황 : [Prompt ... Content A Audio A] + [Content B] 를 붙임 
     '''
-
     # 2-1-1. Content 임베딩
     txt_emb = gpt.text_embedding(target_content_tokens) # [B, T, Dim]
 
     # 2-1-2. Content Positional Embedding
     seq_len = target_content_tokens.shape[1]
-    pos_ids_txt = torch.arange(global_pos, global_pos + seq_len, device=device) # 얘는 뭐임?
+    pos_ids_txt = torch.arange(global_pos, global_pos + seq_len, device=device) 
     
     # Positional Limit Clamping (학습된 길이를 초과하는 것을 방지) 
-    max_pos_txt = gpt.text_pos_embedding.emb.num_embeddings # 얘는 뭐임?
+    max_pos_txt = gpt.text_pos_embedding.emb.num_embeddings 
 
     if((global_pos + seq_len) >= max_pos_txt):
-                print(f"[WARNING] Text Positional Limit Reached! Current: {global_pos + seq_len}, Max: {max_pos_txt}")
+        print(f"[WARNING] Text Positional Limit Reached! Current: {global_pos + seq_len}, Max: {max_pos_txt}")
 
-    pos_ids_txt = torch.clamp(pos_ids_txt, max=max_pos_txt-1) # 얘는 뭐임? 
+    pos_ids_txt = torch.clamp(pos_ids_txt, max=max_pos_txt-1) 
 
     txt_pos = gpt.text_pos_embedding.emb(pos_ids_txt).unsqueeze(0)
     emb_content = txt_emb + txt_pos
 
     # 2-2 Input Embedding 구성 
-
+    
     # 2-2-1. 최초 실행 
     if past_key_values is None:
-        inputs_embeds = torch.cat([cond_latent, emb_content], dim=1)
+
+        # Prompt Cache 저장 
+        out = gpt.gpt(inputs_embeds=cond_latent, use_cache=True)
+        past_key_values = out.past_key_values
+        global_pos = cond_latent.shape[1]
+        prompt_kv_cache = past_key_values
+
+        # Inputs Embedding 구성 
+        inputs_embeds = emb_content 
         # Start Token 초기화
         last_audio_token = torch.tensor([[gpt.start_audio_token]], device=device)
     else:
         # [스트리밍 중]: 이전 KV Cache 뒤에 이번 Content만 붙임 
         inputs_embeds = emb_content
-
+        
     # 2-3. Forward (Text Prefill)
     t2_prefill_start = time.time()
-    
     out = gpt.gpt(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
     past_key_values = out.past_key_values
     
     t2_prefill_end = time.time()
     timing_log['3_kv_prefill'] = (t2_prefill_end - t2_prefill_start) * 1000  # ms
-    
     ''' 
     2.3 추가 설명 )
-
     Before KVCache : [스타일 + 옛날 내용 + 옛날 음향]
         [2.3 포워드 진행 후]
     After KVCache : [스타일 + 옛날 내용 + 옛날 음향 + 이번 텍스트 내용]
@@ -545,11 +499,6 @@ def synthesize_utt_streaming_testflow(
     
     # 2-4. 글로벌 커서 업데이트 (추가된 만큼) 
     global_pos += inputs_embeds.shape[1] 
-
-    '''
-    3. GPT_Forward [Audio Generation]
-    목표: tokens_to_generate 만큼 오디오 토큰을 생성하면 된다. 
-    '''
 
     # =========================================================================
     # 3. GPT_Forward [Audio Generation]
@@ -622,8 +571,24 @@ def synthesize_utt_streaming_testflow(
         # stop token 방지 
         logits[:, :, gpt.stop_audio_token] = -float('inf')
 
-        # 3.4. Greedy Sampling 
-        next_token = torch.argmax(logits, dim=-1) 
+        # 3.4. Top-K Sampling
+        if top_k > 1:
+            # Top-K 샘플링
+            # 1) Top-K 값들과 인덱스 가져오기
+            top_k_logits, top_k_indices = torch.topk(logits, k=top_k, dim=-1)  # [1, 1, k]
+            
+            # 2) Top-K 로짓에 대해 Softmax → 확률 분포
+            top_k_probs = torch.nn.functional.softmax(top_k_logits, dim=-1)  # [1, 1, k]
+            
+            # 3) 확률 분포에서 샘플링
+            sampled_index = torch.multinomial(top_k_probs.squeeze(), num_samples=1)  # [1]
+            
+            # 4) 실제 토큰 ID 가져오기
+            next_token = top_k_indices[0, 0, sampled_index].unsqueeze(0)  # [1, 1]
+        else:
+            # top_k == 1: Greedy Sampling (기존 방식)
+            next_token = torch.argmax(logits, dim=-1)
+        
         all_tokens.append(next_token.item())
 
         # Stop Check 
@@ -657,6 +622,9 @@ def synthesize_utt_streaming_testflow(
     # 4. Sliding Window KVCache - 구현 해야함. 
     # =========================================================================
     # 캐시가 너무 커지면 OOM 방지를 위해 앞을 자름
+
+    if kv_cache_window:
+        pass 
 
     '''
     NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
@@ -701,19 +669,7 @@ def synthesize_utt_streaming_testflow(
 
     # 5.1 Acoustic Latent 제작  
     acoustic_latents = torch.cat(all_latents, dim=1) # [B, tokens_to_generate, Dim]
-    
-    '''
-    gpt_code_stride_len = 1024 로 음성 토큰 1개당 오디오 1024샘플이다.
-    hop_length = 256 으로 하이파이갠 홉 사이즈는 256.
-    즉 4배의 시간 해상도 차이가 존재한다. 
-    1GPT token = 4 Mel frame 이다. 
 
-    원본 GPT 토큰:    [A]             [B]                 [C]          [D]
-                       ↓                ↓                ↓           ↓
-    보간 후:        [A] [a1][a2][a3][B][b1][b2][b3][C][c1][c2][c3][D]...
-                      └─────┘          └─────┘        └─────┘
-                      4 frames         4 frames      4 frames
-    '''
     # 5.2 선형 보간을 활용해서 Mel Input (to Vocoder)
     mel_input = torch.nn.functional.interpolate(
         acoustic_latents.transpose(1, 2),
@@ -722,8 +678,19 @@ def synthesize_utt_streaming_testflow(
     ).squeeze(1)
     
     # 5.3 Hifi-GAN 음성 합성 
-    wav_chunk = genVC_mdl.hifigan.forward(mel_input).squeeze()
-    
+    wav_gen = genVC_mdl.hifigan.forward(mel_input).squeeze()
+
+    # 5.4 Cross-Fading 적용 (stream_config 사용)
+    if cross_fade_duration > 0:
+        wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+            wav_gen,                                      # 현재 생성된 오디오
+            wav_gen_prev,                                 # 이전 청크 (처음엔 None)
+            wav_overlap,                                  # 이전 overlap (처음엔 None)
+            overlap_len=cross_fade_duration # Config에서 가져옴
+        )
+    else:
+        wav_chunk = wav_gen
+
     t4_vocoder_end = time.time()
     timing_log['5_vocoding'] = (t4_vocoder_end - t4_vocoder_start) * 1000  # ms
     
@@ -755,13 +722,154 @@ def synthesize_utt_streaming_testflow(
     
     sys.stdout.write(log_output)
     sys.stdout.flush()
-    
-    
-    # 5.5 Cross-Fading Overlap 구현
-    '''
-    wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
-        wav_chunk, wav_gen_prev, wav_overlap, overlap_len=1024
-    )
-    '''             
-    return wav_chunk, past_key_values, last_audio_token, global_pos 
 
+    if (not use_kv_cache):
+        past_key_values = None 
+        global_pos = 0
+
+    # State Update 
+    state.past_key_values = past_key_values
+    state.last_audio_token = last_audio_token
+    state.global_pos = global_pos
+    state.wav_gen_prev = wav_gen_prev
+    state.wav_overlap = wav_overlap
+    state.prompt_kv_cache = prompt_kv_cache
+
+    # [Debug] Save Chunk Audio
+    debug_dir = "debug_chunks"
+    os.makedirs(debug_dir, exist_ok=True)
+    save_path = os.path.join(debug_dir, f"chunk_{state.chunk_count}.wav")
+    
+    # wav_chunk is [T], need [1, T] for torchaudio
+    # Assuming 24k sample rate as per previous context
+    torchaudio.save(save_path, wav_chunk.unsqueeze(0).cpu(), 24000)
+    print(f"   [Debug] Saved chunk to {save_path}")
+
+    # [Debug] Save Source Chunk Audio
+    src_save_path = os.path.join(debug_dir, f"src_chunk_{state.chunk_count}.wav")
+    # input_tensor is [1, T] or [1, 1, T]
+    if input_tensor.dim() == 3:
+        src_wav_to_save = input_tensor.squeeze(1)
+    else:
+        src_wav_to_save = input_tensor
+    
+    # Source is usually 16k, but let's check config or assume 16k
+    # GenVC input is typically 16k
+    torchaudio.save(src_save_path, src_wav_to_save.cpu(), 16000)
+    print(f"   [Debug] Saved source chunk to {src_save_path}")
+    
+    if hasattr(state, 'chunk_count'):
+        state.chunk_count += 1
+
+    return wav_chunk
+
+@torch.inference_mode() # == Original GenVC Streaming 
+def synthesize_utt_streaming_v3(
+    genVC_mdl, 
+    input_tensor,
+    cond_latent, 
+    chunk_size, 
+    state, 
+    stream_config: Optional[StreamConfig] = None,
+    ):
+    
+    # 1. 상태 및 설정 로드
+    wav_gen_prev = state.wav_gen_prev
+    wav_overlap = state.wav_overlap
+    
+    # Config 설정
+    stream_chunk_size = 15
+    if stream_config:
+        # stream_config에 stream_chunk_size가 있다면 사용 (현재는 없으므로 8 고정 혹은 추가 필요)
+        pass
+
+    # 2. Content Extraction & DVAE
+    content_feat = genVC_mdl.content_extractor.extract_content_features(input_tensor)
+    content_codes = genVC_mdl.content_dvae.get_codebook_indices(content_feat.transpose(1, 2))
+    
+    # 3. GPT Embeddings 계산 (Start/Stop 토큰 포함된 정석 방식)
+    gpt_inputs = genVC_mdl.gpt.compute_embeddings(cond_latent, content_codes)
+
+    # 4. GPT Generator 생성
+    gpt_generator = genVC_mdl.gpt.get_generator(
+        fake_inputs=gpt_inputs,
+        # Config에서 파라미터 가져오기
+        top_p=genVC_mdl.config.top_p,
+        top_k=genVC_mdl.config.top_k,
+        temperature=genVC_mdl.config.temperature,
+        length_penalty=genVC_mdl.config.length_penalty,
+        repetition_penalty=genVC_mdl.config.repetition_penalty,
+        do_sample=True,
+        num_beams=1,
+        num_return_sequences=1,
+        output_attentions=False,
+        output_hidden_states=True,
+    )
+
+    # 5. 토큰 생성 및 오디오 합성 루프
+    last_tokens = []
+    all_latents = []
+    pred_audios = []
+    is_end = False
+    
+    while not is_end:
+        try:
+            x, latent = next(gpt_generator)
+            last_tokens.append(x)
+            all_latents.append(latent)
+        except StopIteration:
+            is_end = True
+
+        # 일정 개수(stream_chunk_size) 모이면 오디오 합성
+        if is_end or (stream_chunk_size > 0 and len(last_tokens) >= stream_chunk_size):
+            if len(all_latents) > 0:
+                acoustic_latents = torch.cat(all_latents, dim=0)[None, :]
+                
+                # Vocoder (HiFi-GAN)
+                mel_input = torch.nn.functional.interpolate(
+                    acoustic_latents.transpose(1, 2),
+                    scale_factor=[genVC_mdl.hifigan_scale_factor],
+                    mode="linear",
+                ).squeeze(1)
+                
+                audio_pred = genVC_mdl.hifigan.forward(mel_input)
+                
+                # Cross-Fading
+                wav_chunk, wav_gen_prev, wav_overlap = handle_chunks(
+                    audio_pred.squeeze(), wav_gen_prev, wav_overlap, 1024
+                )
+                pred_audios.append(wav_chunk)
+                
+            # 리셋
+            last_tokens = []
+            all_latents = []
+
+    # 6. 결과 병합 및 상태 업데이트
+    if len(pred_audios) > 0:
+        synthesized_audio = torch.cat(pred_audios, dim=-1)
+    else:
+        # 생성된 게 없으면 빈 텐서 반환
+        synthesized_audio = torch.tensor([], device=input_tensor.device)
+
+    # 상태 저장
+    state.wav_gen_prev = wav_gen_prev
+    state.wav_overlap = wav_overlap 
+    
+    # wav_chunk is [T], need [1, T] for torchaudio
+    if synthesized_audio.numel() > 0:
+        torchaudio.save(save_path, synthesized_audio.unsqueeze(0).cpu(), 24000)
+        print(f"   [Debug] Saved chunk to {save_path}")
+    
+    # [Debug] Save Source Chunk Audio
+    src_save_path = os.path.join(debug_dir, f"src_chunk_{state.chunk_count}.wav")
+    if input_tensor.dim() == 3:
+        src_wav_to_save = input_tensor.squeeze(1)
+    else:
+        src_wav_to_save = input_tensor
+    torchaudio.save(src_save_path, src_wav_to_save.cpu(), 16000)
+    print(f"   [Debug] Saved source chunk to {src_save_path}")
+
+    if hasattr(state, 'chunk_count'):
+        state.chunk_count += 1
+
+    return synthesized_audio
