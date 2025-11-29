@@ -341,7 +341,6 @@ def synthesize_utt_streaming_testflow(
 
     # HyperParameter Setup
     if stream_config:
-        print("스트림 콘피그가 있어요.")
         chunk_size = stream_config.chunk_size
         dvae_context = stream_config.dvae_context
         use_kv_cache = stream_config.use_kv_cache
@@ -352,7 +351,6 @@ def synthesize_utt_streaming_testflow(
         past_chunk_size = stream_config.past_chunk_size
 
     else:
-        print("이거 기준 맞지?")
         chunk_size = chunk_size
         dvae_context = 0
         use_kv_cache = True 
@@ -627,46 +625,43 @@ def synthesize_utt_streaming_testflow(
     
     last_audio_token = curr_token 
     # =========================================================================
-    # 4. Sliding Window KVCache - 구현 해야함. 
+    # 4. Sliding Window KVCache
     # =========================================================================
     # 캐시가 너무 커지면 OOM 방지를 위해 앞을 자름
 
-    if kv_cache_window:
-        pass 
+    if kv_cache_window and use_kv_cache:
+        NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
+        KEEP_RECENT_TOKENS = 100
 
-    '''
-    NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
-    KEEP_RECENT_TOKENS = 100
-
-    MAX_WINDOW = NUM_STYLE_TOKENS + KEEP_RECENT_TOKENS
-    
-    #TODO: layer_past shape 로깅으로 실제 검증 확인하기 
-    
-    if past_key_values is not None:
-        # past_key_values[0]은 (Key, Value) 튜플임
-        # Key Shape: (Batch, Num_Heads, Seq_Len, Head_Dim) -> Index 2가 Seq_Len
-        current_seq_len = past_key_values[0][0].shape[2] 
+        MAX_WINDOW = NUM_STYLE_TOKENS + KEEP_RECENT_TOKENS
         
-        if current_seq_len > MAX_WINDOW:
-            new_kv = []
-            for layer_past in past_key_values: 
-                # layer_past: (Key, Value)
-                k, v = layer_past
-                
-                # 1. Key Pruning
-                k_style = k[:, :, :NUM_STYLE_TOKENS, :]
-                k_recent = k[:, :, -KEEP_RECENT_TOKENS:, :]
-                k_pruned = torch.cat([k_style, k_recent], dim=2)
-                
-                # 2. Value Pruning
-                v_style = v[:, :, :NUM_STYLE_TOKENS, :]
-                v_recent = v[:, :, -KEEP_RECENT_TOKENS:, :]
-                v_pruned = torch.cat([v_style, v_recent], dim=2)
-                
-                new_kv.append((k_pruned, v_pruned))
+        if past_key_values is not None:
+            # past_key_values[0] : (Key, Value) tuple
+            # Key Shape: (Batch, Num_Heads, Seq_Len, Head_Dim) -> Index 2 is Seq_Len
+            current_seq_len = past_key_values[0][0].shape[2] 
             
-            past_key_values = tuple(new_kv)
-    '''
+            if current_seq_len > MAX_WINDOW:
+                new_kv = []
+                for layer_past in past_key_values: 
+                    # layer_past: (Key, Value)
+                    k, v = layer_past
+                    
+                    # 1. Key Pruning
+                    k_style = k[:, :, :NUM_STYLE_TOKENS, :]
+                    k_recent = k[:, :, -KEEP_RECENT_TOKENS:, :]
+                    k_pruned = torch.cat([k_style, k_recent], dim=2)
+                    
+                    # 2. Value Pruning
+                    v_style = v[:, :, :NUM_STYLE_TOKENS, :]
+                    v_recent = v[:, :, -KEEP_RECENT_TOKENS:, :]
+                    v_pruned = torch.cat([v_style, v_recent], dim=2)
+                    
+                    new_kv.append((k_pruned, v_pruned))
+                
+                past_key_values = tuple(new_kv)
+
+            print(f"[KV Cache Debug] Pruned to {current_seq_len} tokens")
+
     # =========================================================================
     # 5. Vocoding (HiFi-GAN)
     # =========================================================================
@@ -743,32 +738,6 @@ def synthesize_utt_streaming_testflow(
     state.wav_gen_prev = wav_gen_prev
     state.wav_overlap = wav_overlap
     state.prompt_kv_cache = prompt_kv_cache
-
-    # [Debug] Save Chunk Audio
-    debug_dir = "debug_chunks"
-    os.makedirs(debug_dir, exist_ok=True)
-    save_path = os.path.join(debug_dir, f"chunk_{state.chunk_count}.wav")
-    
-    # wav_chunk is [T], need [1, T] for torchaudio
-    # Assuming 24k sample rate as per previous context
-    torchaudio.save(save_path, wav_chunk.unsqueeze(0).cpu(), 24000)
-    print(f"   [Debug] Saved chunk to {save_path}")
-
-    # [Debug] Save Source Chunk Audio
-    src_save_path = os.path.join(debug_dir, f"src_chunk_{state.chunk_count}.wav")
-    # input_tensor is [1, T] or [1, 1, T]
-    if input_tensor.dim() == 3:
-        src_wav_to_save = input_tensor.squeeze(1)
-    else:
-        src_wav_to_save = input_tensor
-    
-    # Source is usually 16k, but let's check config or assume 16k
-    # GenVC input is typically 16k
-    torchaudio.save(src_save_path, src_wav_to_save.cpu(), 16000)
-    print(f"   [Debug] Saved source chunk to {src_save_path}")
-    
-    if hasattr(state, 'chunk_count'):
-        state.chunk_count += 1
 
     return wav_chunk
 
