@@ -341,24 +341,27 @@ def synthesize_utt_streaming_testflow(
 
     # HyperParameter Setup
     if stream_config:
-        chunk_size = stream_config.chunk_size
+        # chunk_size = stream_config.chunk_size # Removed
+        chunk_size = 1679 + 1280 * stream_config.token_size
         dvae_context = stream_config.dvae_context
         use_kv_cache = stream_config.use_kv_cache
         kv_cache_window = stream_config.kv_cache_window # OK
         cross_fade_duration = stream_config.cross_fade_duration
         top_k = stream_config.top_k
-        num_content_token = stream_config.num_content_token
+        token_size = stream_config.token_size
         past_chunk_size = stream_config.past_chunk_size
+        use_past_vocoding = stream_config.use_past_vocoding
 
     else:
         chunk_size = chunk_size
         dvae_context = 0
-        use_kv_cache = True 
-        kv_cache_window = 100
+        use_kv_cache = False 
+        kv_cache_window = 500
         cross_fade_duration = int(1024 * 1) 
         top_k: int = 1 # Greedy Sampling 
-        past_chunk_size: int = 0 # 0이면 현재 청크만 사용함 
-        num_content_token = int(chunk_size / 1280)
+        token_size = int((chunk_size - 1679) / 1280)
+        past_chunk_size: int = 0 
+        use_past_vocoding = True 
 
     # =========================================================================
     # 0-2. Constants & Timing Setup
@@ -631,7 +634,7 @@ def synthesize_utt_streaming_testflow(
 
     if kv_cache_window and use_kv_cache:
         NUM_STYLE_TOKENS = cond_latent.shape[1] if cond_latent is not None else 0
-        KEEP_RECENT_TOKENS = 100
+        KEEP_RECENT_TOKENS = kv_cache_window
 
         MAX_WINDOW = NUM_STYLE_TOKENS + KEEP_RECENT_TOKENS
         
@@ -673,16 +676,51 @@ def synthesize_utt_streaming_testflow(
 
     # 5.1 Acoustic Latent 제작  
     acoustic_latents = torch.cat(all_latents, dim=1) # [B, tokens_to_generate, Dim]
+    mel_code = acoustic_latents.transpose(1, 2) # [B, Dim, T]
 
-    # 5.2 선형 보간을 활용해서 Mel Input (to Vocoder)
-    mel_input = torch.nn.functional.interpolate(
-        acoustic_latents.transpose(1, 2),
-        scale_factor=[genVC_mdl.hifigan_scale_factor],
-        mode="linear",
-    ).squeeze(1)
-    
-    # 5.3 Hifi-GAN 음성 합성 
-    wav_gen = genVC_mdl.hifigan.forward(mel_input).squeeze()
+    # 5.2 선형 보간을 활용해서 Mel Input (to Vocoder) 
+    if use_past_vocoding:
+        if state.past_mel_tokens is not None:
+            combined_mel_code = torch.cat([state.past_mel_tokens, mel_code], dim=2)
+        else:
+            combined_mel_code = mel_code
+            
+        # Interpolate
+        mel_input = torch.nn.functional.interpolate(
+            combined_mel_code,
+            scale_factor=[genVC_mdl.hifigan_scale_factor],
+            mode="linear",
+        ).squeeze(1)
+        
+        # Vocode
+        wav_gen_full = genVC_mdl.hifigan.forward(mel_input).squeeze()
+        
+        # Slice
+        T_total = combined_mel_code.shape[2]
+        T_curr = mel_code.shape[2]
+        S_total = wav_gen_full.shape[-1]
+        
+        # Calculate samples for current chunk
+        S_curr = int(S_total * T_curr / T_total)
+        wav_gen = wav_gen_full[-S_curr:]
+        
+        # Update State (Max 50 tokens)
+        MAX_PAST_MEL = 50
+        new_past = combined_mel_code
+        # Sliding Window 
+        if new_past.shape[2] > MAX_PAST_MEL:
+            new_past = new_past[:, :, -MAX_PAST_MEL:]
+        state.past_mel_tokens = new_past
+        
+    else:
+        mel_input = torch.nn.functional.interpolate(
+            acoustic_latents.transpose(1, 2),
+            scale_factor=[genVC_mdl.hifigan_scale_factor],
+            mode="linear",
+        ).squeeze(1)
+        
+        # 5.3 Hifi-GAN 음성 합성 
+        wav_gen = genVC_mdl.hifigan.forward(mel_input).squeeze()
 
     # 5.4 Cross-Fading 적용 (stream_config 사용)
     if cross_fade_duration > 0:
