@@ -1,5 +1,5 @@
 from inference.model_init import model_init
-from inference.inference_utils import synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2
+from inference.inference_utils import synthesize_utt_streaming_testflow, synthesize_utt_streaming_v2, synthesize_utt_streaming_v3
 from utils import load_audio
 import torch
 import torchaudio
@@ -18,13 +18,23 @@ class StreamingState:
     wav_gen_prev: torch.Tensor = None
     wav_overlap: torch.Tensor = None
     prompt_kv_cache: torch.Tensor = None
+    chunk_count: int = 0
+    prev_audio_tail: torch.Tensor = None
 
 class StreamingBuffer:
-    def __init__(self, model, device, ref_audio, args):
+    def __init__(self, model, device, ref_audio, args, stream_config=None):
         self.model = model
         self.device = device
+        self.args = args  
+        self.stream_config = stream_config
         self.p = pyaudio.PyAudio()
-        self.chunk = 5120*2 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
+        
+        # StreamConfig가 있으면 chunk_size 덮어쓰기
+        if stream_config:
+            self.chunk = stream_config.chunk_size
+        else:
+            self.chunk = 5120*2 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
+            
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
@@ -41,8 +51,8 @@ class StreamingBuffer:
         self.output_queue = queue.Queue()
         self.writer = None
         
-        if(args.save_audio):
-            self.writer = torchaudio.io.StreamWriter(args.output_path)
+        if(self.args.save_audio):
+            self.writer = torchaudio.io.StreamWriter(self.args.output_path)
             self.writer.add_audio_stream(sample_rate=self.output_rate, num_channels=1)
 
 
@@ -57,7 +67,7 @@ class StreamingBuffer:
                 data = b'\x00' * frame_count * 4 
             return (data, pyaudio.paContinue)
 
-        if(args.mode == 'file_stream'):
+        if(self.args.mode == 'file_stream'):
             pass
         else:
             self.input_stream = self.p.open(
@@ -80,9 +90,9 @@ class StreamingBuffer:
 
     def start(self, src_wav):
         print("곧 시작합니다")
-        if(args.mode == 'echo' or args.mode == 'live_stream'):
+        if(self.args.mode == 'echo' or self.args.mode == 'live_stream'):
             self.input_stream.start_stream()
-        elif(args.mode == 'file_stream'):
+        elif(self.args.mode == 'file_stream'):
             src_wav = src_wav.to(self.device)
             for i in range(0, src_wav.shape[1], self.chunk):
 
@@ -101,14 +111,14 @@ class StreamingBuffer:
         
         try:
             while True:
-                if(args.mode == 'echo' or args.mode == 'live_stream'):
+                if(self.args.mode == 'echo' or self.args.mode == 'live_stream'):
                     if(self.input_queue.empty()):
                         time.sleep(0.1)
                         continue
                     in_data = self.input_queue.get()
                     input_np = np.frombuffer(in_data, dtype=np.float32).copy()
                     current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
-                elif(args.mode == 'file_stream'):
+                elif(self.args.mode == 'file_stream'):
                     if(self.input_queue.empty()):
                         break
                     current_tensor = self.input_queue.get()
@@ -125,18 +135,18 @@ class StreamingBuffer:
                     self.context_buffer.pop(0)
 
                 # 이거지우면 변환함수 돌아감
-                if(args.mode == 'echo'):
+                if(self.args.mode == 'echo'):
                     converted_tensor = current_tensor
-                elif(args.mode == 'live_stream' or args.mode == 'file_stream'):
+                elif(self.args.mode == 'live_stream' or self.args.mode == 'file_stream'):
                     with torch.no_grad():
                         converted_tensor  = synthesize_utt_streaming_testflow(
                         self.model, 
                         input_tensor,
                         self.cond_latent,
-                        self.chunk,
-                        self.state 
+                        self.chunk, # Changed from chunk_size to self.chunk to maintain syntactic correctness
+                        self.state,  # Pass the entire state object
+                        stream_config=self.stream_config # Config 전달
                         )
-
                         if(converted_tensor is None):
                             continue
                 
@@ -150,7 +160,7 @@ class StreamingBuffer:
             print("종료")
         finally:
             # 닫기
-            if(args.mode == 'echo' or args.mode == 'live_stream'):
+            if(self.args.mode == 'echo' or self.args.mode == 'live_stream'):
                 self.input_stream.stop_stream()
                 self.input_stream.close()
             self.output_stream.stop_stream()

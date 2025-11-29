@@ -14,11 +14,11 @@ wandb/
 pymp-*/
 tmp*/
 test/
-samples/sample.wav
 analysis/
 infer_test*
 infer_stream_*
 *.wav 
-samples/converted.wav
+samples/*
 pre_trained/*
-experiment/*
+experiment/data
+experiment/results
