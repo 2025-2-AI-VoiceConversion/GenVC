@@ -5,10 +5,9 @@ CONFIGS = {
     
     # Baseline
     "baseline": StreamConfig(
-        chunk_size=10240,
         dvae_context=0,
         past_chunk_size=0,
-        num_content_token=8,
+        token_size=8,
         use_kv_cache=True,
         kv_cache_window=100,
         top_k=10,
@@ -18,7 +17,7 @@ CONFIGS = {
     
     # Low Latency
     "low_latency": StreamConfig(
-        chunk_size=5120,  
+        token_size=4,
         kv_cache_window=50,
         top_k=5, 
         cross_fade_duration=50,
@@ -27,7 +26,7 @@ CONFIGS = {
     
     # High Quality
     "high": StreamConfig(
-        chunk_size=10240,  
+        token_size=7,   
         dvae_context=0, 
         past_chunk_size=0,  
         kv_cache_window=1000,
@@ -39,7 +38,7 @@ CONFIGS = {
     
     # KV Cache Optimization
     "optimized_cache": StreamConfig(
-        chunk_size=10240,
+        token_size=7,
         kv_cache_window=150,
         cross_fade_duration=100,
         experiment_name="optimized_cache"
@@ -47,8 +46,8 @@ CONFIGS = {
     
     # Memory Efficient
     "memory_efficient": StreamConfig(
-        chunk_size=10240,
-        use_kv_cache=True,
+        token_size=7,
+        use_kv_cache=False,
         kv_cache_window=30,  # 작은 윈도우
         experiment_name="memory_efficient"
     ),
@@ -68,10 +67,11 @@ def generate_grid_configs():
     import itertools
     
     param_grid = {
-        'chunk_size': [5120, 10240, 20480],
+        'token_size': [4, 5, 6, 7], 
         'kv_cache_window': [50, 100, 200],
         'top_k': [5, 10, 15],
         'cross_fade_duration': [50, 100, 200],
+        'use_kv_cache': [True, False],
     }
     
     configs = []
@@ -84,10 +84,7 @@ def generate_grid_configs():
         # 모든 필드를 이름에 포함
         # 순서: chunk -> dvae -> past -> num -> use -> win -> topk -> fade
         name_parts = ["grid"]
-        name_parts.append(f"chunk{temp_config.chunk_size}")
-        name_parts.append(f"dvae{temp_config.dvae_context}")
-        name_parts.append(f"past{temp_config.past_chunk_size}")
-        name_parts.append(f"num{temp_config.num_content_token}")
+        name_parts.append(f"token{temp_config.token_size}")
         name_parts.append(f"use{'T' if temp_config.use_kv_cache else 'F'}") # True/False -> T/F
         name_parts.append(f"win{temp_config.kv_cache_window}")
         name_parts.append(f"topk{temp_config.top_k}")

@@ -20,6 +20,7 @@ class StreamingState:
     prompt_kv_cache: torch.Tensor = None
     chunk_count: int = 0
     prev_audio_tail: torch.Tensor = None
+    past_mel_tokens: torch.Tensor = None # For Past Vocoding
 
 class StreamingBuffer:
     def __init__(self, model, device, ref_audio, args, stream_config=None):
@@ -30,16 +31,17 @@ class StreamingBuffer:
         self.p = pyaudio.PyAudio()
         
         # StreamConfig가 있으면 chunk_size 덮어쓰기
+        # StreamConfig가 있으면 chunk_size 계산
         if stream_config:
-            self.chunk = stream_config.chunk_size
+            self.chunk = 1679 + 1280 * stream_config.token_size
         else:
-            self.chunk = 4639 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
+            self.chunk = 1679 + 1280 * 7 # Default token_size = 7
             
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
-        self.FUTURE_CHUNK = 0
+        self.PAST_CHUNK = (self.chunk-1679) // 1280 
 
         # 스트리밍 중 상태변수 관리용 
         self.state = StreamingState()
@@ -138,6 +140,7 @@ class StreamingBuffer:
                 past_tensors = self.context_buffer[-self.PAST_CHUNK:] if self.context_buffer else []
                 # 2. 합쳐
                 input_tensor = torch.cat(past_tensors + [current_tensor], dim=1)
+
                 # 3. 지로패딩
                 padding_size = 1679 + 1280 * self.PAST_CHUNK
                 if input_tensor.shape[1] < padding_size:
@@ -157,8 +160,15 @@ class StreamingBuffer:
                     converted_tensor = current_tensor
                 elif(self.args.mode == 'live_stream' or self.args.mode == 'file_stream'):
                     with torch.no_grad():
-                        converted_tensor  = synthesize_utt_streaming_v2(model, input_tensor, self.cond_latent, self.state)
-                        if(converted_tensor is None):
+                        converted_tensor  = synthesize_utt_streaming_testflow(
+                        self.model, 
+                        input_tensor,
+                        self.cond_latent,
+                        self.chunk, # Changed from chunk_size to self.chunk to maintain syntactic correctness
+                        self.state,  # Pass the entire state object
+                        stream_config=self.stream_config # Config 전달
+                        )
+                        if(converted_tensor is None): 
                             continue
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
