@@ -33,7 +33,7 @@ class StreamingBuffer:
         if stream_config:
             self.chunk = stream_config.chunk_size
         else:
-            self.chunk = 5120*2 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
+            self.chunk = 5120 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
             
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)

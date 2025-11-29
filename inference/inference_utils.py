@@ -341,6 +341,7 @@ def synthesize_utt_streaming_testflow(
 
     # HyperParameter Setup
     if stream_config:
+        print("스트림 콘피그가 있어요.")
         chunk_size = stream_config.chunk_size
         dvae_context = stream_config.dvae_context
         use_kv_cache = stream_config.use_kv_cache
@@ -351,9 +352,10 @@ def synthesize_utt_streaming_testflow(
         past_chunk_size = stream_config.past_chunk_size
 
     else:
+        print("이거 기준 맞지?")
         chunk_size = chunk_size
         dvae_context = 0
-        use_kv_cache = False 
+        use_kv_cache = True 
         kv_cache_window = 100
         cross_fade_duration = int(1024 * 1) 
         top_k: int = 1 # Greedy Sampling 
@@ -373,6 +375,9 @@ def synthesize_utt_streaming_testflow(
 
     expected_chunk_size = int(chunk_size * SCALE_FACTOR)
     tokens_to_generate = int(expected_chunk_size / GPT_CODE_STRIDE) 
+
+    # -- TEST -- : 1:1.875이 아니라 1:2로 추론테스트 해보자. 
+    tokens_to_generate = int(chunk_size // 1280) * 2
     
     # 청크 사이즈가 너무 작아서 토큰을 만들 수 없는 경우 (예외처리)
     if tokens_to_generate == 0:
