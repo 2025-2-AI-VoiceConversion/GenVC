@@ -33,7 +33,7 @@ class StreamingBuffer:
         if stream_config:
             self.chunk = stream_config.chunk_size
         else:
-            self.chunk = 5120*2 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
+            self.chunk = 4639 # 이걸 올리면 퀄리티가 올라갈거 [1280 : content, 1024 : audio] , lcm(1280, 1024) = 5120
             
         self.ref_audio = ref_audio
         self.ref_audio = self.ref_audio.to(self.device)
@@ -45,7 +45,10 @@ class StreamingBuffer:
         self.state = StreamingState()
 
         self.input_rate = 16000 # 441000 96000
-        self.output_rate = 24000
+        if(args.mode == 'echo'):
+            self.output_rate = 16000
+        else:
+            self.output_rate = 24000
 
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
@@ -88,6 +91,14 @@ class StreamingBuffer:
             stream_callback=output_callback
         )
 
+    def to_tensor(self, in_data):
+        input_np = np.frombuffer(in_data, dtype=np.float32).copy()
+        current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
+        return current_tensor
+
+    def to_numpy(self, tensor):
+        return tensor.squeeze().cpu().detach().numpy().astype(np.float32)
+
     def start(self, src_wav):
         print("곧 시작합니다")
         if(self.args.mode == 'echo' or self.args.mode == 'live_stream'):
@@ -116,22 +127,29 @@ class StreamingBuffer:
                         time.sleep(0.1)
                         continue
                     in_data = self.input_queue.get()
-                    input_np = np.frombuffer(in_data, dtype=np.float32).copy()
-                    current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
+                    current_tensor = self.to_tensor(in_data)
                 elif(self.args.mode == 'file_stream'):
                     if(self.input_queue.empty()):
                         break
                     current_tensor = self.input_queue.get()
-                # 버퍼에 있는 데이터 + 현재 데이터
-                padding_size = (self.FUTURE_CHUNK - len(self.context_buffer)) * self.chunk
-                if self.context_buffer:
-                    input_tensor = torch.cat(self.context_buffer + [current_tensor], dim=1)
-                else:
-                    input_tensor = current_tensor
-                input_tensor = torch.nn.functional.pad(input_tensor, (padding_size, 0), "constant", 0)
                 
+                # 과거 붙여
+                # 1. 과거 가져와
+                past_tensors = self.context_buffer[-self.PAST_CHUNK:] if self.context_buffer else []
+                # 2. 합쳐
+                input_tensor = torch.cat(past_tensors + [current_tensor], dim=1)
+                # 3. 지로패딩
+                padding_size = 1679 + 1280 * self.PAST_CHUNK
+                if input_tensor.shape[1] < padding_size:
+                    pad_len = padding_size - input_tensor.shape[1]
+                    input_tensor = torch.nn.functional.pad(input_tensor, (pad_len, 0), "constant", 0)
+                # 4. 잘르
+                input_tensor = input_tensor[:, -padding_size:]
+                print(f"Input Shape: {input_tensor.shape}")
+                # 5. 버퍼 늫기
                 self.context_buffer.append(current_tensor)
-                if len(self.context_buffer) > self.FUTURE_CHUNK:
+                # 메모리 관리를 위해 버퍼 크기 제한 (PAST_CHUNK보다 조금 넉넉히 잡거나 딱 맞춰도 됨)
+                while len(self.context_buffer) > self.PAST_CHUNK:
                     self.context_buffer.pop(0)
 
                 # 이거지우면 변환함수 돌아감
@@ -139,14 +157,7 @@ class StreamingBuffer:
                     converted_tensor = current_tensor
                 elif(self.args.mode == 'live_stream' or self.args.mode == 'file_stream'):
                     with torch.no_grad():
-                        converted_tensor  = synthesize_utt_streaming_testflow(
-                        self.model, 
-                        input_tensor,
-                        self.cond_latent,
-                        self.chunk, # Changed from chunk_size to self.chunk to maintain syntactic correctness
-                        self.state,  # Pass the entire state object
-                        stream_config=self.stream_config # Config 전달
-                        )
+                        converted_tensor  = synthesize_utt_streaming_v2(model, input_tensor, self.cond_latent, self.state)
                         if(converted_tensor is None):
                             continue
                 
