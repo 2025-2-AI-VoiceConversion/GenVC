@@ -355,7 +355,7 @@ def synthesize_utt_streaming_testflow(
         dvae_context = 0
         use_kv_cache = False 
         kv_cache_window = 100
-        cross_fade_duration = 1024 
+        cross_fade_duration = int(1024 * 1) 
         top_k: int = 1 # Greedy Sampling 
         past_chunk_size: int = 0 # 0이면 현재 청크만 사용함 
         num_content_token = int(chunk_size / 1280)
@@ -422,8 +422,11 @@ def synthesize_utt_streaming_testflow(
         full_codes = full_codes[:, 1:] 
         
     # 다음 턴을 위해 현재 청크의 마지막 320 샘플 저장
-    state.prev_audio_tail = input_tensor[:, -DVAE_CONTEXT_LEN:]
-
+    if DVAE_CONTEXT_LEN > 0:
+        state.prev_audio_tail = input_tensor[:, -DVAE_CONTEXT_LEN:]
+    else: 
+        state.prev_audio_tail = None
+        
     #TODO: print full_codes len 
     print("full_codes.shape : ", full_codes.shape)
     
@@ -633,6 +636,7 @@ def synthesize_utt_streaming_testflow(
     MAX_WINDOW = NUM_STYLE_TOKENS + KEEP_RECENT_TOKENS
     
     #TODO: layer_past shape 로깅으로 실제 검증 확인하기 
+    
     if past_key_values is not None:
         # past_key_values[0]은 (Key, Value) 튜플임
         # Key Shape: (Batch, Num_Heads, Seq_Len, Head_Dim) -> Index 2가 Seq_Len

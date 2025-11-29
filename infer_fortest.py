@@ -147,7 +147,7 @@ class StreamingBuffer:
                         self.state,  # Pass the entire state object
                         stream_config=self.stream_config # Config 전달
                         )
-                        if(converted_tensor is None):
+                        if(converted_tensor is None): 
                             continue
                 
                 output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
