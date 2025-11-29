@@ -19,12 +19,15 @@ class StreamingBuffer:
         self.ref_audio = self.ref_audio.to(self.device)
         self.cond_latent = model.get_gpt_cond_latents(self.ref_audio, model.config.audio.sample_rate)
         self.context_buffer = []
-        self.FUTURE_CHUNK = 0
+        self.PAST_CHUNK = 0
         self.past_key_values = None 
         self.global_pos = 0
         self.last_audio_token = None
         self.input_rate = 16000 # 441000 96000
-        self.output_rate = 24000
+        if(args.mode == 'echo'):
+            self.output_rate = 16000
+        else:
+            self.output_rate = 24000
 
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
@@ -67,6 +70,14 @@ class StreamingBuffer:
             stream_callback=output_callback
         )
 
+    def to_tensor(self, in_data):
+        input_np = np.frombuffer(in_data, dtype=np.float32).copy()
+        current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
+        return current_tensor
+
+    def to_numpy(self, tensor):
+        return tensor.squeeze().cpu().detach().numpy().astype(np.float32)
+
     def start(self, src_wav):
         print("곧 시작합니다")
         if(args.mode == 'echo' or args.mode == 'live_stream'):
@@ -74,7 +85,6 @@ class StreamingBuffer:
         elif(args.mode == 'file_stream'):
             src_wav = src_wav.to(self.device)
             for i in range(0, src_wav.shape[1], self.chunk):
-
                 chunk = src_wav[:, i:i + self.chunk]
                 print("chunk.shape : ", chunk.shape)
                 if chunk.shape[1] < self.chunk:
@@ -95,23 +105,39 @@ class StreamingBuffer:
                         time.sleep(0.1)
                         continue
                     in_data = self.input_queue.get()
-                    input_np = np.frombuffer(in_data, dtype=np.float32).copy()
-                    current_tensor = torch.from_numpy(input_np).to(self.device).unsqueeze(0) 
+                    current_tensor = self.to_tensor(in_data)
+                    print(current_tensor.shape)
                 elif(args.mode == 'file_stream'):
                     if(self.input_queue.empty()):
+                        time.sleep(3)
                         break
                     current_tensor = self.input_queue.get()
+                self.context_buffer.append(current_tensor)
+
                 # 버퍼에 있는 데이터 + 현재 데이터
-                padding_size = (self.FUTURE_CHUNK - len(self.context_buffer)) * self.chunk
-                if self.context_buffer:
-                    input_tensor = torch.cat(self.context_buffer + [current_tensor], dim=1)
+                padding_size = 1679 + 1280 * self.PAST_CHUNK
+                past_tensor = None
+                for i in range(self.PAST_CHUNK):
+                    if self.context_buffer:
+                        past_tensor = torch.cat(self.context_buffer[-i-1], past_tensor, dim=1)
+                    else:
+                        break
+                    
+                if past_tensor is not None:
+                    input_tensor = torch.cat((past_tensor, current_tensor), dim=1)
                 else:
                     input_tensor = current_tensor
-                input_tensor = torch.nn.functional.pad(input_tensor, (padding_size, 0), "constant", 0)
                 
-                self.context_buffer.append(current_tensor)
-                if len(self.context_buffer) > self.FUTURE_CHUNK:
+                #padding size보다 작으면 왼쪽을 0으로 패딩
+                if(input_tensor.shape[1] < padding_size):
+                    input_tensor = torch.nn.functional.pad(input_tensor, (padding_size - input_tensor.shape[1], 0), "constant", 0)
+                #너무 클때도 패딩사이즈에 맞춤
+                input_tensor = input_tensor[:, -padding_size:]
+                print(input_tensor.shape)
+
+                while len(self.context_buffer) > self.PAST_CHUNK:
                     self.context_buffer.pop(0)
+                    
 
                 # 이거지우면 변환함수 돌아감
                 if(args.mode == 'echo'):
@@ -127,15 +153,18 @@ class StreamingBuffer:
                         self.global_pos,
                         self.last_audio_token
                         )
-
+                        
                         if(converted_tensor is None):
                             continue
-                
-                output_np = converted_tensor.squeeze().cpu().detach().numpy().astype(np.float32)
+
+                output_np = self.to_numpy(converted_tensor)
                 self.output_queue.put(output_np.tobytes())
 
                 if writer_stream is not None:
-                    writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
+                    if(args.mode == 'echo'):
+                        pass
+                    else:
+                        writer_stream.write_audio_chunk(0, converted_tensor.unsqueeze(1).cpu())
 
         except KeyboardInterrupt:
             print("종료")
@@ -150,6 +179,7 @@ class StreamingBuffer:
             
             if writer_stream is not None:
                 writer_stream.close()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
